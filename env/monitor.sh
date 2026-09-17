@@ -26,8 +26,17 @@ PREVIOUS_ACCOUNT=""
 get_cpu_usage() {
     CPU_LINE=$(top -n 1 -b 2>/dev/null | grep -i "cpu" | head -1)
 
-    if [ -n "$CPU_LINE" ]; then
-        echo "$CPU_LINE"
+    if [ -z "$CPU_LINE" ]; then
+        echo "N/A"
+        return
+    fi
+
+    TOTAL=$(echo "$CPU_LINE" | grep -o '[0-9]*%cpu' | head -1 | tr -d '%cpu')
+    IDLE=$(echo "$CPU_LINE" | grep -o '[0-9]*%idle' | head -1 | tr -d '%idle')
+
+    if [ -n "$TOTAL" ] && [ -n "$IDLE" ] && [ "$TOTAL" -gt 0 ]; then
+        USED=$(( (TOTAL - IDLE) * 100 / TOTAL ))
+        echo "${USED}%"
     else
         echo "N/A"
     fi
