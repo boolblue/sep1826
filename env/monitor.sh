@@ -210,7 +210,7 @@ join_game() {
     fi
 
     echo "Waiting 10 seconds before game join..."
-    sleep 10
+    sleep 6
 
     if ! is_instance_running; then
         echo "Roblox stopped before game join."
