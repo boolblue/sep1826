@@ -16,12 +16,17 @@ CURL="/data/data/com.termux/files/usr/bin/curl"
 CHECK_INTERVAL=5
 REPORT_INTERVAL=300
 
-DISCONNECT_CONFIRM_COUNT=2
-REJOIN_WAIT=15
-REJOIN_TIMEOUT=45
+JOIN_WAIT=10
+JOIN_TIMEOUT=45
+RECOVERY_WAIT=15
+GAME_RECHECK_INTERVAL=60
 
 PREVIOUS_INSTANCE_STATUS=""
 PREVIOUS_ACCOUNT=""
+
+GAME_STATE="UNKNOWN"
+LAST_JOIN_TIME=0
+RECOVERY_RUNNING=0
 
 get_cpu_usage() {
     CPU_LINE=$(top -n 1 -b 2>/dev/null | grep -i "cpu" | head -1)
@@ -34,11 +39,11 @@ get_cpu_usage() {
     TOTAL=$(echo "$CPU_LINE" | grep -o '[0-9]*%cpu' | head -1 | tr -d '%cpu')
     IDLE=$(echo "$CPU_LINE" | grep -o '[0-9]*%idle' | head -1 | tr -d '%idle')
 
-    if [ -n "$TOTAL" ] && [ -n "$IDLE" ] && [ "$TOTAL" -gt 0 ]; then
+    if [ -n "$TOTAL" ] && [ -n "$IDLE" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
         USED=$(( (TOTAL - IDLE) * 100 / TOTAL ))
         echo "${USED}%"
     else
-        echo "N/A"
+        echo "$CPU_LINE"
     fi
 }
 
@@ -127,25 +132,99 @@ get_roblox_account() {
         return
     fi
 
-    ACCOUNT_DATA=$(grep -o 'username\\":\\"[^"]*\\",\\"userIdentifier\\":\\"[^"]*\\",\\"displayName\\":\\"[^"]*\\",\\"showInAccountPicker\\":[^,]*,\\"signInTimestamp\\":[0-9]*,\\"userId\\":\\"[0-9]*\\"' "$ROBLOX_STORAGE" 2>/dev/null)
+    RESULT=$(python3 - "$ROBLOX_STORAGE" 2>/dev/null <<'PY'
+import sys
+import json
+import re
 
-    if [ -z "$ACCOUNT_DATA" ]; then
-        echo "N/A|N/A"
-        return
-    fi
+path = sys.argv[1]
 
-    RESULT=$(echo "$ACCOUNT_DATA" | while read -r ACCOUNT
-    do
-        USERNAME=$(echo "$ACCOUNT" | sed 's/.*username\\":\\"//;s/\\".*//')
-        USER_ID=$(echo "$ACCOUNT" | sed 's/.*userId\\":\\"//;s/\\".*//')
-        TIMESTAMP=$(echo "$ACCOUNT" | sed 's/.*signInTimestamp\\"://;s/,.*//')
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = f.read()
+except:
+    print("N/A|N/A")
+    sys.exit()
 
-        if [ -n "$USERNAME" ] && [ -n "$USER_ID" ] && [ -n "$TIMESTAMP" ]; then
-            echo "$TIMESTAMP|$USERNAME|$USER_ID"
-        fi
-    done | sort -n | tail -1 | cut -d'|' -f2-3)
+accounts = []
 
-    if [ -n "$RESULT" ]; then
+patterns = [
+    r'username\\":\\"([^"]*)\\".*?userIdentifier\\":\\"([^"]*)\\".*?userId\\":\\"([0-9]+)\\"',
+    r'userIdentifier\\":\\"([^"]*)\\".*?displayName\\":\\"([^"]*)\\".*?userId\\":\\"([0-9]+)\\"'
+]
+
+for match in re.finditer(patterns[0], data):
+    username = match.group(1)
+    identifier = match.group(2)
+    user_id = match.group(3)
+
+    start = max(0, match.start() - 1000)
+    end = min(len(data), match.end() + 1000)
+
+    section = data[start:end]
+
+    picker = re.search(r'showInAccountPicker\\":(true|false)', section)
+    signed_out = re.search(r'signOutTimestamp\\":([0-9]+)', section)
+    signed_in = re.search(r'signInTimestamp\\":([0-9]+)', section)
+
+    show_picker = picker.group(1) == "true" if picker else False
+    sign_out = int(signed_out.group(1)) if signed_out else None
+    sign_in = int(signed_in.group(1)) if signed_in else 0
+
+    if sign_out is not None:
+        continue
+
+    accounts.append({
+        "username": username,
+        "user_id": user_id,
+        "picker": show_picker,
+        "sign_in": sign_in
+    })
+
+if not accounts:
+    for match in re.finditer(patterns[1], data):
+        identifier = match.group(1)
+        user_id = match.group(3)
+
+        start = max(0, match.start() - 1000)
+        end = min(len(data), match.end() + 1000)
+
+        section = data[start:end]
+
+        picker = re.search(r'showInAccountPicker\\":(true|false)', section)
+        signed_out = re.search(r'signOutTimestamp\\":([0-9]+)', section)
+        signed_in = re.search(r'signInTimestamp\\":([0-9]+)', section)
+
+        show_picker = picker.group(1) == "true" if picker else False
+        sign_out = int(signed_out.group(1)) if signed_out else None
+        sign_in = int(signed_in.group(1)) if signed_in else 0
+
+        if sign_out is not None:
+            continue
+
+        accounts.append({
+            "username": identifier,
+            "user_id": user_id,
+            "picker": show_picker,
+            "sign_in": sign_in
+        })
+
+if not accounts:
+    print("N/A|N/A")
+    sys.exit()
+
+picker_accounts = [a for a in accounts if a["picker"]]
+
+if picker_accounts:
+    selected = picker_accounts[-1]
+else:
+    selected = sorted(accounts, key=lambda x: x["sign_in"], reverse=True)[0]
+
+print(selected["username"] + "|" + selected["user_id"])
+PY
+)
+
+    if [ -n "$RESULT" ] && echo "$RESULT" | grep -q '|'; then
         echo "$RESULT"
     else
         echo "N/A|N/A"
@@ -155,9 +234,7 @@ get_roblox_account() {
 launch_instance() {
     echo "Launching $TARGET_PACKAGE..."
 
-    /system/bin/am start \
-        -n "$TARGET_PACKAGE/$TARGET_ACTIVITY" \
-        >/dev/null 2>&1
+    /system/bin/am start -n "$TARGET_PACKAGE/$TARGET_ACTIVITY" >/dev/null 2>&1
 
     echo "Waiting for Roblox instance..."
 
@@ -209,8 +286,8 @@ join_game() {
         return 1
     fi
 
-    echo "Waiting 10 seconds before game join..."
-    sleep 6
+    echo "Waiting ${JOIN_WAIT} seconds before game join..."
+    sleep "$JOIN_WAIT"
 
     if ! is_instance_running; then
         echo "Roblox stopped before game join."
@@ -224,7 +301,146 @@ join_game() {
         -d "roblox://placeId=$ROBLOX_GAME_ID" \
         >/dev/null 2>&1
 
+    LAST_JOIN_TIME=$(/system/bin/date +%s)
+    GAME_STATE="JOINING"
+
     echo "Game join command sent."
+
+    return 0
+}
+
+wait_for_game_start() {
+    echo "Waiting for game to start..."
+
+    COUNT=0
+
+    while [ "$COUNT" -lt "$JOIN_TIMEOUT" ]
+    do
+        if ! is_instance_running; then
+            echo "Roblox instance disappeared while joining."
+            GAME_STATE="NOT_IN_GAME"
+            return 1
+        fi
+
+        sleep 1
+        COUNT=$((COUNT + 1))
+    done
+
+    GAME_STATE="IN_GAME"
+
+    echo "Game join window completed."
+    return 0
+}
+
+force_rejoin() {
+    if [ "$RECOVERY_RUNNING" -eq 1 ]; then
+        return
+    fi
+
+    RECOVERY_RUNNING=1
+
+    echo "=============================="
+    echo "ROBLOX GAME RECOVERY"
+    echo "=============================="
+
+    echo "Waiting ${RECOVERY_WAIT} seconds before recovery..."
+    sleep "$RECOVERY_WAIT"
+
+    if ! is_instance_running; then
+        echo "Roblox instance is closed."
+        echo "Launching Roblox..."
+
+        launch_instance
+
+        if [ $? -ne 0 ]; then
+            echo "Failed to launch Roblox."
+            RECOVERY_RUNNING=0
+            return 1
+        fi
+
+        wait_for_account
+
+        if [ $? -ne 0 ]; then
+            echo "Account not detected after launch."
+            RECOVERY_RUNNING=0
+            return 1
+        fi
+
+        join_game
+        wait_for_game_start
+
+        RECOVERY_RUNNING=0
+        return 0
+    fi
+
+    echo "Roblox instance is still running."
+    echo "Sending game join command again..."
+
+    /system/bin/am start \
+        -a android.intent.action.VIEW \
+        -d "roblox://placeId=$ROBLOX_GAME_ID" \
+        >/dev/null 2>&1
+
+    LAST_JOIN_TIME=$(/system/bin/date +%s)
+    GAME_STATE="JOINING"
+
+    sleep "$JOIN_TIMEOUT"
+
+    if is_instance_running; then
+        GAME_STATE="IN_GAME"
+        echo "Game rejoin command completed."
+        RECOVERY_RUNNING=0
+        return 0
+    fi
+
+    echo "Game rejoin did not keep Roblox running."
+    echo "Restarting Roblox instance..."
+
+    /system/bin/am force-stop "$TARGET_PACKAGE" >/dev/null 2>&1
+
+    sleep 3
+
+    launch_instance
+
+    if [ $? -ne 0 ]; then
+        echo "Roblox relaunch failed."
+        RECOVERY_RUNNING=0
+        return 1
+    fi
+
+    wait_for_account
+
+    if [ $? -ne 0 ]; then
+        echo "Account detection failed after relaunch."
+        RECOVERY_RUNNING=0
+        return 1
+    fi
+
+    join_game
+    wait_for_game_start
+
+    RECOVERY_RUNNING=0
+
+    return 0
+}
+
+check_game_state() {
+    if ! is_instance_running; then
+        GAME_STATE="NOT_IN_GAME"
+        return 1
+    fi
+
+    if [ "$GAME_STATE" = "UNKNOWN" ]; then
+        return 0
+    fi
+
+    if [ "$GAME_STATE" = "JOINING" ]; then
+        return 0
+    fi
+
+    if [ "$GAME_STATE" = "IN_GAME" ]; then
+        return 0
+    fi
 
     return 0
 }
@@ -246,136 +462,13 @@ start_and_join() {
 
     join_game
 
-    return $?
-}
-
-get_ui_dump() {
-    UI_FILE="/data/local/tmp/roblox_ui.xml"
-
-    /system/bin/uiautomator dump "$UI_FILE" >/dev/null 2>&1
-
-    if [ -f "$UI_FILE" ]; then
-        cat "$UI_FILE"
-        rm -f "$UI_FILE"
-    fi
-}
-
-is_disconnect_screen() {
-    if ! is_instance_running; then
-        return 0
-    fi
-
-    UI_DATA=$(get_ui_dump)
-
-    if [ -z "$UI_DATA" ]; then
+    if [ $? -ne 0 ]; then
         return 1
     fi
 
-    echo "$UI_DATA" | grep -i -q -E \
-        'disconnected|connection failed|connection error|error code: ?(277|279|266|280)|error 277|error 279|error 266|error 280|lost connection|internet connection'
-}
-
-wait_for_disconnect_confirmation() {
-    COUNT=0
-
-    while [ "$COUNT" -lt "$DISCONNECT_CONFIRM_COUNT" ]
-    do
-        if is_disconnect_screen; then
-            COUNT=$((COUNT + 1))
-
-            if [ "$COUNT" -lt "$DISCONNECT_CONFIRM_COUNT" ]; then
-                sleep "$CHECK_INTERVAL"
-            fi
-        else
-            return 1
-        fi
-    done
+    wait_for_game_start
 
     return 0
-}
-
-rejoin_game() {
-    echo "Attempting Roblox game rejoin..."
-
-    /system/bin/am start \
-        -a android.intent.action.VIEW \
-        -d "roblox://placeId=$ROBLOX_GAME_ID" \
-        >/dev/null 2>&1
-
-    COUNT=0
-
-    while [ "$COUNT" -lt "$REJOIN_TIMEOUT" ]
-    do
-        sleep 1
-
-        if ! is_disconnect_screen; then
-            echo "Roblox rejoin appears successful."
-            return 0
-        fi
-
-        COUNT=$((COUNT + 1))
-    done
-
-    echo "Rejoin did not recover Roblox."
-    return 1
-}
-
-recover_roblox() {
-    echo "=============================="
-    echo "ROBLOX DISCONNECT DETECTED"
-    echo "=============================="
-
-    echo "Waiting ${REJOIN_WAIT} seconds before recovery..."
-    sleep "$REJOIN_WAIT"
-
-    if ! is_instance_running; then
-        echo "Instance disappeared."
-        echo "Launching instance again..."
-
-        launch_instance
-
-        if [ $? -ne 0 ]; then
-            echo "Instance relaunch failed."
-            return 1
-        fi
-
-        wait_for_account
-        join_game
-
-        return $?
-    fi
-
-    echo "Attempting direct game rejoin..."
-
-    rejoin_game
-
-    if [ $? -eq 0 ]; then
-        return 0
-    fi
-
-    echo "Direct rejoin failed."
-    echo "Relaunching Roblox instance..."
-
-    /system/bin/am force-stop "$TARGET_PACKAGE" >/dev/null 2>&1
-
-    sleep 3
-
-    launch_instance
-
-    if [ $? -ne 0 ]; then
-        echo "Instance relaunch failed."
-        return 1
-    fi
-
-    wait_for_account
-
-    if [ $? -ne 0 ]; then
-        return 1
-    fi
-
-    join_game
-
-    return $?
 }
 
 send_report() {
@@ -400,6 +493,7 @@ send_report() {
     BATTERY=$(get_battery)
     STORAGE=$(get_storage)
     UPTIME=$(get_uptime)
+
     APP_STATUS=$(get_instance_status)
 
     ACCOUNT_DATA=$(get_roblox_account)
@@ -417,7 +511,6 @@ send_report() {
 
     echo "Roblox Account: ${ROBLOX_USERNAME}"
     echo "Roblox User ID: ${ROBLOX_USER_ID}"
-
     echo "Taking screenshot..."
 
     /system/bin/screencap -p "$SCREEN_PATH" >/dev/null 2>&1
@@ -433,60 +526,18 @@ send_report() {
         {
             "title": "Cloudphone Monitor",
             "fields": [
-                {
-                    "name": "Time",
-                    "value": "${DISCORD_TIME}",
-                    "inline": false
-                },
-                {
-                    "name": "Roblox Account",
-                    "value": "${ROBLOX_USERNAME}",
-                    "inline": true
-                },
-                {
-                    "name": "Roblox User ID",
-                    "value": "${ROBLOX_USER_ID}",
-                    "inline": true
-                },
-                {
-                    "name": "CPU Usage",
-                    "value": "${CPU_PERCENT}",
-                    "inline": true
-                },
-                {
-                    "name": "RAM Usage",
-                    "value": "${RAM_INFO}",
-                    "inline": true
-                },
-                {
-                    "name": "Temperature",
-                    "value": "${TEMPERATURE}",
-                    "inline": true
-                },
-                {
-                    "name": "Battery",
-                    "value": "${BATTERY}",
-                    "inline": true
-                },
-                {
-                    "name": "Storage",
-                    "value": "${STORAGE}",
-                    "inline": true
-                },
-                {
-                    "name": "Uptime",
-                    "value": "${UPTIME}",
-                    "inline": true
-                },
-                {
-                    "name": "Instance",
-                    "value": "${APP_STATUS}",
-                    "inline": true
-                }
+                {"name": "Time","value": "${DISCORD_TIME}","inline": false},
+                {"name": "Roblox Account","value": "${ROBLOX_USERNAME}","inline": true},
+                {"name": "Roblox User ID","value": "${ROBLOX_USER_ID}","inline": true},
+                {"name": "CPU Usage","value": "${CPU_PERCENT}","inline": true},
+                {"name": "RAM Usage","value": "${RAM_INFO}","inline": true},
+                {"name": "Temperature","value": "${TEMPERATURE}","inline": true},
+                {"name": "Battery","value": "${BATTERY}","inline": true},
+                {"name": "Storage","value": "${STORAGE}","inline": true},
+                {"name": "Uptime","value": "${UPTIME}","inline": true},
+                {"name": "Instance","value": "${APP_STATUS}","inline": true}
             ],
-            "image": {
-                "url": "attachment://screen.png"
-            }
+            "image": {"url": "attachment://screen.png"}
         }
     ]
 }
@@ -495,9 +546,12 @@ EOF
 
     echo "Sending report to Discord..."
 
-    CURL_RESULT=$("$CURL" -sS -X POST "$WEBHOOK_URL" \
+    CURL_RESULT=$("$CURL" -sS \
+        -X POST \
+        "$WEBHOOK_URL" \
         -F "payload_json=${PAYLOAD}" \
-        -F "file=@${SCREEN_PATH};filename=screen.png" 2>&1)
+        -F "file=@${SCREEN_PATH};filename=screen.png" \
+        2>&1)
 
     CURL_EXIT=$?
 
@@ -511,8 +565,6 @@ EOF
 }
 
 watchdog() {
-    DISCONNECT_COUNT=0
-
     PREVIOUS_INSTANCE_STATUS=$(get_instance_status)
     PREVIOUS_ACCOUNT=$(get_roblox_account)
 
@@ -535,17 +587,29 @@ watchdog() {
         if [ "$CURRENT_INSTANCE_STATUS" != "$PREVIOUS_INSTANCE_STATUS" ]; then
 
             if [ "$CURRENT_INSTANCE_STATUS" = "Closed" ]; then
+
                 echo "Roblox instance changed: Running -> Closed"
-                echo "Launching Roblox instance..."
 
-                launch_instance
+                GAME_STATE="NOT_IN_GAME"
 
-                if [ $? -eq 0 ]; then
-                    wait_for_account
-                    join_game
+                if [ "$RECOVERY_RUNNING" -eq 0 ]; then
+                    echo "Launching Roblox instance..."
+
+                    launch_instance
+
+                    if [ $? -eq 0 ]; then
+                        wait_for_account
+                        join_game
+                        wait_for_game_start
+                    fi
                 fi
+
             else
+
                 echo "Roblox instance changed: Closed -> Running"
+
+                GAME_STATE="UNKNOWN"
+
             fi
 
             PREVIOUS_INSTANCE_STATUS="$CURRENT_INSTANCE_STATUS"
@@ -561,13 +625,19 @@ watchdog() {
         if [ "$CURRENT_ACCOUNT" != "$PREVIOUS_ACCOUNT" ]; then
 
             if [ "$CURRENT_USERNAME" = "N/A" ]; then
+
                 echo "Roblox account data became unavailable."
+
             elif [ "$PREVIOUS_USERNAME" = "N/A" ]; then
+
                 echo "Roblox account detected: $CURRENT_USERNAME ($CURRENT_USER_ID)"
+
             else
+
                 echo "Roblox account changed:"
                 echo "Previous: $PREVIOUS_USERNAME ($PREVIOUS_USER_ID)"
                 echo "Current:  $CURRENT_USERNAME ($CURRENT_USER_ID)"
+
             fi
 
             PREVIOUS_ACCOUNT="$CURRENT_ACCOUNT"
@@ -577,23 +647,47 @@ watchdog() {
 
         if is_instance_running; then
 
-            if is_disconnect_screen; then
-                DISCONNECT_COUNT=$((DISCONNECT_COUNT + 1))
+            CURRENT_TIME=$(/system/bin/date +%s)
 
-                if [ "$DISCONNECT_COUNT" -ge "$DISCONNECT_CONFIRM_COUNT" ]; then
-                    recover_roblox
-                    DISCONNECT_COUNT=0
+            if [ "$GAME_STATE" = "IN_GAME" ]; then
 
-                    PREVIOUS_INSTANCE_STATUS=$(get_instance_status)
-                    PREVIOUS_ACCOUNT=$(get_roblox_account)
-                    PREVIOUS_USERNAME=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f1)
-                    PREVIOUS_USER_ID=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f2)
+                ELAPSED=$((CURRENT_TIME - LAST_JOIN_TIME))
+
+                if [ "$ELAPSED" -ge "$GAME_RECHECK_INTERVAL" ]; then
+
+                    echo "Game state recheck."
+
+                    /system/bin/am start \
+                        -a android.intent.action.VIEW \
+                        -d "roblox://placeId=$ROBLOX_GAME_ID" \
+                        >/dev/null 2>&1
+
+                    LAST_JOIN_TIME=$CURRENT_TIME
+
+                    echo "Game join verification command sent."
+
                 fi
-            else
-                DISCONNECT_COUNT=0
+
+            elif [ "$GAME_STATE" = "UNKNOWN" ]; then
+
+                echo "Game state unknown."
+                echo "Sending initial game join..."
+
+                join_game
+
+            elif [ "$GAME_STATE" = "NOT_IN_GAME" ]; then
+
+                if [ "$RECOVERY_RUNNING" -eq 0 ]; then
+                    echo "Roblox is running but game state is not active."
+                    force_rejoin
+                fi
+
             fi
+
         else
-            DISCONNECT_COUNT=0
+
+            GAME_STATE="NOT_IN_GAME"
+
         fi
 
         sleep "$CHECK_INTERVAL"
@@ -605,14 +699,30 @@ echo "Cloudphone Monitor"
 echo "=============================="
 echo "Watchdog interval: ${CHECK_INTERVAL}s"
 echo "Discord report interval: ${REPORT_INTERVAL}s"
-echo "Disconnect detection: Enabled"
-echo "Disconnect confirmations: ${DISCONNECT_CONFIRM_COUNT}"
+echo "Automatic game joining: Enabled"
+echo "Automatic recovery: Enabled"
 echo "OCR: Disabled"
 echo "Display resizing: Disabled"
 echo "=============================="
 
 if ! is_instance_running; then
     start_and_join
+else
+    ACCOUNT_DATA=$(get_roblox_account)
+
+    if [ -n "$ACCOUNT_DATA" ]; then
+        ROBLOX_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
+
+        if [ "$ROBLOX_USERNAME" != "N/A" ]; then
+            echo "Existing Roblox account detected: $ROBLOX_USERNAME"
+        fi
+    fi
+
+    echo "Roblox instance already running."
+    echo "Sending game join command..."
+
+    join_game
+    wait_for_game_start
 fi
 
 watchdog &
