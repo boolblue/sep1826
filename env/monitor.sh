@@ -31,6 +31,10 @@ JOIN_WAIT=8
 JOIN_TIMEOUT=45
 RECOVERY_WAIT=10
 REJOIN_COOLDOWN=30        # minimum seconds between join attempts
+UI_CHECK_INTERVAL=3       # seconds between uiautomator dumps
+UDP_CHECK_ENABLED=1
+NO_UDP_GRACE=25           # seconds of no-UDP before we consider "not in game"
+NOT_IN_GAME_STREAK=0
 
 # ------------------------- State -----------------------------
 PREVIOUS_INSTANCE_STATUS=""
@@ -39,6 +43,7 @@ GAME_STATE="UNKNOWN"       # UNKNOWN | JOINING | IN_GAME | NOT_IN_GAME
 LAST_JOIN_TIME=0
 RECOVERY_RUNNING=0
 LOGIN_ATTEMPTED=0
+ACCOUNT_SEEN_THIS_SESSION=0
 
 # ============================================================
 #  System stat helpers
@@ -147,6 +152,27 @@ is_roblox_focused() {
     case "$TOP" in
         "$TARGET_PACKAGE"/*) return 0 ;;
     esac
+    return 1
+}
+
+get_roblox_uid() {
+    stat -c %u "/data/data/$TARGET_PACKAGE" 2>/dev/null
+}
+
+count_conns_for_uid() {
+    FILE="$1"; UID="$2"
+    [ -z "$UID" ] && { echo 0; return; }
+    [ -r "$FILE" ] || { echo 0; return; }
+    awk -v u="$UID" '$8 == u {c++} END {print c+0}' "$FILE" 2>/dev/null
+}
+
+# True if Roblox currently owns at least one UDP socket.
+is_in_game_network() {
+    [ "$UDP_CHECK_ENABLED" -eq 1 ] || return 1
+    UID=$(get_roblox_uid)
+    [ -z "$UID" ] && return 1
+    [ "$(count_conns_for_uid /proc/net/udp  "$UID")" -gt 0 ] && return 0
+    [ "$(count_conns_for_uid /proc/net/udp6 "$UID")" -gt 0 ] && return 0
     return 1
 }
 
@@ -446,7 +472,8 @@ auto_login() {
 #  Launch / join
 # ============================================================
 launch_instance() {
-    ACCOUNT_SEEN_THIS_SESSION=0
+    ACCOUNT_SEEN_THIS_SESSION=1
+    ACCOUNT_DATA=$(get_roblox_account)
     LOGIN_ATTEMPTED=0
     UI_DUMP_TS=0
     echo "Launching $TARGET_PACKAGE..."
@@ -472,14 +499,17 @@ wait_for_account() {
         ACCOUNT_DATA=$(get_roblox_account)
         U=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
         if [ -n "$U" ] && [ "$U" != "N/A" ]; then
+            ACCOUNT_SEEN_THIS_SESSION=1
             echo "Roblox account detected: $U"
             return 0
         fi
 
-        # Try auto-login once, only after the UI has had a chance to settle.
-        if [ "$LOGIN_ATTEMPTED" -eq 0 ] && [ "$COUNT" -ge 5 ]; then
+        # Only attempt login if we have NEVER seen an account this session.
+        if [ "$ACCOUNT_SEEN_THIS_SESSION" -eq 0 ] \
+           && [ "$LOGIN_ATTEMPTED" -eq 0 ] \
+           && [ "$COUNT" -ge 5 ]; then
             if is_login_screen; then
-                echo "Login screen detected."
+                echo "Login screen detected (no prior session)."
                 auto_login
                 LOGIN_ATTEMPTED=1
             fi
@@ -522,7 +552,7 @@ join_game() {
 # Waits for the game activity to be *focused*. Does NOT count "app still alive"
 # as success — we require the game activity to actually appear.
 wait_for_game_start() {
-    echo "Waiting for game activity..."
+    echo "Waiting for game connection..."
     COUNT=0
     while [ "$COUNT" -lt "$JOIN_TIMEOUT" ]; do
         if ! is_process_alive; then
@@ -530,19 +560,18 @@ wait_for_game_start() {
             GAME_STATE="NOT_IN_GAME"
             return 1
         fi
-        if is_in_game_activity; then
+        if is_in_game_network; then
             GAME_STATE="IN_GAME"
-            echo "Game activity detected."
+            echo "Connected (UDP active)."
             return 0
         fi
         sleep 1
         COUNT=$((COUNT + 1))
     done
-    # We didn't see the game activity, but the process is still alive.
-    # Mark as IN_GAME to avoid hammering the join intent — the watchdog
-    # will only rejoin if the activity is definitely not the game activity.
-    GAME_STATE="IN_GAME"
-    echo "Join window elapsed (process still alive)."
+    # Still alive but no UDP yet — could be a slow load. Leave state as
+    # JOINING so the watchdog's grace timer handles it, not a fake IN_GAME.
+    GAME_STATE="JOINING"
+    echo "Join window elapsed without UDP."
     return 0
 }
 
@@ -803,72 +832,77 @@ watchdog() {
             PREVIOUS_USERNAME="$CURRENT_USERNAME"
             PREVIOUS_USER_ID="$CURRENT_USER_ID"
         fi
-
-        # ---- screen-state reconciliation ----
+        
+        # ---- state reconciliation (network + screen) ----
         if is_process_alive; then
 
-            if ! is_roblox_focused; then
-                # Roblox backgrounded by the user — don't touch it.
-                SCREEN_STATE="BACKGROUND"
-
+            # Primary signal: UDP presence.
+            if is_in_game_network; then
+                if [ "$GAME_STATE" != "IN_GAME" ]; then
+                    echo "In-game (UDP active)."
+                fi
+                GAME_STATE="IN_GAME"
+                NOT_IN_GAME_STREAK=0
+                SCREEN_STATE="IN_GAME"
             else
-                # Classify what's actually on screen (throttled inside).
-                NEW_SCREEN=$(detect_roblox_screen)
+                NOT_IN_GAME_STREAK=$((NOT_IN_GAME_STREAK + 1))
+
+                # Secondary signal: UI dump only when we're outside a game.
+                NEW_SCREEN="UNKNOWN"
+                if ! is_roblox_focused; then
+                    NEW_SCREEN="BACKGROUND"
+                else
+                    NEW_SCREEN=$(detect_roblox_screen)
+                fi
 
                 if [ "$NEW_SCREEN" != "$SCREEN_STATE" ]; then
                     echo "Screen state: $SCREEN_STATE -> $NEW_SCREEN"
                     SCREEN_STATE="$NEW_SCREEN"
                 fi
 
-                case "$SCREEN_STATE" in
-                    IN_GAME)
-                        GAME_STATE="IN_GAME"
-                        ;;
-
-                    LOADING)
-                        # Roblox is doing something — leave it alone.
-                        GAME_STATE="JOINING"
-                        ;;
-
-                    DISCONNECTED)
-                        ELAPSED=$((NOW - LAST_JOIN_TIME))
-                        if [ "$RECOVERY_RUNNING" -eq 0 ] && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                            echo "Disconnect detected — rejoining."
-                            # Tap 'Leave'/'OK' first if present, then re-issue join.
-                            leave_btn=$(grep -oE 'text="(Leave|OK|Okay|Reconnect)"[^>]*bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"' "$UI_DUMP_PATH" | head -1)
-                            if [ -n "$leave_btn" ]; then
-                                B=$(echo "$leave_btn" | grep -oE '\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]')
-                                X1=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\1/')
-                                Y1=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\2/')
-                                X2=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\3/')
-                                Y2=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\4/')
-                                X=$(( (X1 + X2) / 2 ))
-                                Y=$(( (Y1 + Y2) / 2 ))
-                                /system/bin/input tap "$X" "$Y"
-                                sleep 2
-                            fi
-                            force_rejoin
-                        fi
+                case "$NEW_SCREEN" in
+                    LOGIN)
+                        GAME_STATE="NOT_IN_GAME"
+                        NOT_IN_GAME_STREAK=0
                         ;;
 
                     HOME)
                         GAME_STATE="NOT_IN_GAME"
                         ELAPSED=$((NOW - LAST_JOIN_TIME))
-                        if [ "$RECOVERY_RUNNING" -eq 0 ] && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                            echo "On Roblox home — rejoining game."
+                        if [ "$RECOVERY_RUNNING" -eq 0 ] \
+                           && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
+                            echo "On Roblox home — re-joining."
                             join_game
                             wait_for_game_start
                             UI_DUMP_TS=0
+                            NOT_IN_GAME_STREAK=0
                         fi
                         ;;
 
-                    LOGIN)
-                        GAME_STATE="NOT_IN_GAME"
-                        # wait_for_account handles auto-login guardrails.
+                    BACKGROUND)
+                        # User switched away — leave Roblox alone.
                         ;;
 
-                    UNKNOWN|BACKGROUND)
-                        # Not enough signal — do nothing.
+                    *)
+                        # UNKNOWN or LOADING — rely on the UDP grace timer.
+                        if [ "$NOT_IN_GAME_STREAK" -ge "$NO_UDP_GRACE" ]; then
+                            ELAPSED=$((NOW - LAST_JOIN_TIME))
+                            if [ "$RECOVERY_RUNNING" -eq 0 ] \
+                               && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
+                                echo "No UDP for ${NOT_IN_GAME_STREAK}s — re-joining."
+                                GAME_STATE="NOT_IN_GAME"
+                                if ! is_roblox_focused; then
+                                    /system/bin/am start -n \
+                                        "$TARGET_PACKAGE/$TARGET_ACTIVITY" \
+                                        >/dev/null 2>&1
+                                    sleep 2
+                                fi
+                                send_join_intent
+                                GAME_STATE="JOINING"
+                                NOT_IN_GAME_STREAK=0
+                                UI_DUMP_TS=0
+                            fi
+                        fi
                         ;;
                 esac
             fi
@@ -876,6 +910,7 @@ watchdog() {
         else
             GAME_STATE="NOT_IN_GAME"
             SCREEN_STATE="UNKNOWN"
+            NOT_IN_GAME_STREAK=0
         fi
 
         sleep "$CHECK_INTERVAL"
