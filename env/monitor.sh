@@ -2,7 +2,7 @@
 # ============================================================
 #  Cloudphone Monitor v2
 #  - Real-time (1s) watchdog
-#  - Correct in-game detection (no more lobby rejoin loop)
+#  - UDP + CPU in-game detection (no uiautomator in loop)
 #  - Robust Roblox account detection
 #  - Optional auto-login from account.txt
 # ============================================================
@@ -25,18 +25,21 @@ CURL="/data/data/com.termux/files/usr/bin/curl"
 PYTHON="/data/data/com.termux/files/usr/bin/python3"
 
 # Timing
-CHECK_INTERVAL=1          # real-time poll
+CHECK_INTERVAL=1          # watchdog poll
 REPORT_INTERVAL=300
 JOIN_WAIT=8
 JOIN_TIMEOUT=45
 RECOVERY_WAIT=10
 REJOIN_COOLDOWN=30        # minimum seconds between join attempts
-UI_CHECK_INTERVAL=3       # seconds between uiautomator dumps
-NO_UDP_GRACE=25           # seconds of "out of game" before we rejoin
+OUT_OF_GAME_GRACE=15      # seconds of "out of game" before rejoining
+UI_CHECK_INTERVAL=3       # seconds between uiautomator dumps (login only)
 
 # Detection thresholds
 UDP_CHECK_ENABLED=1
-CPU_INGAME_THRESHOLD=25   # Roblox CPU% above this = likely in-game
+CPU_INGAME_THRESHOLD=25   # Roblox CPU% (single core) above this = likely in-game
+
+# Debug
+STATUS_EVERY=60           # print a status line every N seconds
 
 # ------------------------- State -----------------------------
 PREVIOUS_INSTANCE_STATUS=""
@@ -49,6 +52,9 @@ ACCOUNT_SEEN_THIS_SESSION=0
 NOT_IN_GAME_STREAK=0
 LAST_CPU_TICKS=0
 LAST_CPU_SAMPLE_TS=0
+LAST_STATUS_TS=0
+LAST_CPU_PCT=0
+LAST_UDP=0
 
 # ============================================================
 #  System stat helpers
@@ -127,25 +133,14 @@ get_ram() {
 }
 
 # ============================================================
-#  Process / activity detection
+#  Process detection
 # ============================================================
 is_process_alive() {
     /system/bin/pidof "$TARGET_PACKAGE" >/dev/null 2>&1
 }
 
-get_top_activity() {
-    /system/bin/dumpsys activity activities 2>/dev/null \
-        | grep -m1 -E "mResumedActivity|ResumedActivity" \
-        | grep -oE '[a-zA-Z0-9._]+/[a-zA-Z0-9._$]+' \
-        | head -1
-}
-
-is_roblox_focused() {
-    TOP=$(get_top_activity)
-    case "$TOP" in
-        "$TARGET_PACKAGE"/*) return 0 ;;
-    esac
-    return 1
+get_roblox_pid() {
+    /system/bin/pidof "$TARGET_PACKAGE" 2>/dev/null | awk '{print $1}'
 }
 
 get_instance_status() {
@@ -157,7 +152,7 @@ get_instance_status() {
 }
 
 # ============================================================
-#  In-game detection  (UDP + CPU)
+#  In-game detection  (UDP + CPU only — fast)
 # ============================================================
 get_roblox_uid() {
     stat -c %u "/data/data/$TARGET_PACKAGE" 2>/dev/null
@@ -170,7 +165,6 @@ count_conns_for_uid() {
     awk -v u="$UID" '$8 == u {c++} END {print c+0}' "$FILE" 2>/dev/null
 }
 
-# True if Roblox currently owns at least one UDP socket.
 is_in_game_network() {
     [ "$UDP_CHECK_ENABLED" -eq 1 ] || return 1
     UID=$(get_roblox_uid)
@@ -180,10 +174,6 @@ is_in_game_network() {
     return 1
 }
 
-get_roblox_pid() {
-    /system/bin/pidof "$TARGET_PACKAGE" 2>/dev/null | awk '{print $1}'
-}
-
 get_roblox_cpu_ticks() {
     P=$(get_roblox_pid)
     [ -z "$P" ] && { echo 0; return; }
@@ -191,7 +181,7 @@ get_roblox_cpu_ticks() {
     awk '{print $14 + $15}' "/proc/$P/stat" 2>/dev/null
 }
 
-# Returns Roblox CPU% (of one core) since the last call.
+# Roblox CPU% of one core since last call.
 get_roblox_cpu_pct() {
     NOW=$(/system/bin/date +%s)
     TICKS=$(get_roblox_cpu_ticks)
@@ -205,7 +195,7 @@ get_roblox_cpu_pct() {
 
     DT=$((NOW - LAST_CPU_SAMPLE_TS))
     if [ "$DT" -le 0 ]; then
-        echo 0
+        echo "$LAST_CPU_PCT"
         return
     fi
 
@@ -215,13 +205,24 @@ get_roblox_cpu_pct() {
     LAST_CPU_TICKS="$TICKS"
     LAST_CPU_SAMPLE_TS="$NOW"
 
-    # CLK_TCK is 100 on Android. pct of one core = DD / (DT*100) * 100 = DD/DT.
-    echo $((DD / DT))
+    PCT=$((DD / DT))
+    LAST_CPU_PCT=$PCT
+    echo "$PCT"
 }
 
 reset_cpu_sampling() {
     LAST_CPU_TICKS=0
     LAST_CPU_SAMPLE_TS=0
+    LAST_CPU_PCT=0
+}
+
+# Returns 1 (in-game) or 0 (not in-game) based on UDP + CPU.
+is_in_game() {
+    CPU=$1
+    UDP=$2
+    [ "$UDP" -eq 1 ] && return 0
+    [ "$CPU" -ge "$CPU_INGAME_THRESHOLD" ] && return 0
+    return 1
 }
 
 # ============================================================
@@ -356,23 +357,13 @@ PY
 }
 
 # ============================================================
-#  UI automation helpers  (auto-login)
+#  UI automation helpers  (auto-login only)
 # ============================================================
 UI_DUMP_TS=0
 
 ui_dump() {
     /system/bin/uiautomator dump "$UI_DUMP_PATH" >/dev/null 2>&1
     UI_DUMP_TS=$(/system/bin/date +%s)
-    [ -f "$UI_DUMP_PATH" ]
-}
-
-get_ui_dump() {
-    NOW=$(/system/bin/date +%s)
-    if [ $((NOW - UI_DUMP_TS)) -lt "$UI_CHECK_INTERVAL" ] && [ -f "$UI_DUMP_PATH" ]; then
-        return 0
-    fi
-    /system/bin/uiautomator dump "$UI_DUMP_PATH" >/dev/null 2>&1
-    UI_DUMP_TS=$NOW
     [ -f "$UI_DUMP_PATH" ]
 }
 
@@ -447,7 +438,7 @@ PY
 }
 
 is_login_screen() {
-    get_ui_dump || return 1
+    ui_dump || return 1
     [ ! -f "$UI_DUMP_PATH" ] && return 1
 
     HAS_PW=0
@@ -612,16 +603,12 @@ wait_for_game_start() {
         fi
 
         CPU_NOW=$(get_roblox_cpu_pct)
+        UDP_NOW=0
+        is_in_game_network && UDP_NOW=1
 
-        if is_in_game_network; then
+        if is_in_game "$CPU_NOW" "$UDP_NOW"; then
             GAME_STATE="IN_GAME"
-            echo "Connected (UDP active)."
-            return 0
-        fi
-
-        if [ "$CPU_NOW" -ge "$CPU_INGAME_THRESHOLD" ]; then
-            GAME_STATE="IN_GAME"
-            echo "Connected (cpu=${CPU_NOW}%)."
+            echo "Connected (cpu=${CPU_NOW}% udp=${UDP_NOW})."
             return 0
         fi
 
@@ -671,7 +658,10 @@ force_rejoin() {
     GAME_STATE="JOINING"
     sleep "$JOIN_TIMEOUT"
 
-    if is_in_game_network; then
+    CPU_NOW=$(get_roblox_cpu_pct)
+    UDP_NOW=0
+    is_in_game_network && UDP_NOW=1
+    if is_in_game "$CPU_NOW" "$UDP_NOW"; then
         GAME_STATE="IN_GAME"
         RECOVERY_RUNNING=0
         return 0
@@ -713,9 +703,6 @@ send_report() {
     [ -z "$ROBLOX_USERNAME" ] && ROBLOX_USERNAME="N/A"
     [ -z "$ROBLOX_USER_ID" ]  && ROBLOX_USER_ID="N/A"
 
-    TOP_ACTIVITY=$(get_top_activity)
-    [ -z "$TOP_ACTIVITY" ] && TOP_ACTIVITY="N/A"
-
     echo "Account: $ROBLOX_USERNAME ($ROBLOX_USER_ID)"
     echo "Taking screenshot..."
     /system/bin/screencap -p "$SCREEN_PATH" >/dev/null 2>&1
@@ -741,7 +728,8 @@ send_report() {
                 {"name": "Uptime","value": "${UPTIME}","inline": true},
                 {"name": "Instance","value": "${APP_STATUS}","inline": true},
                 {"name": "Game State","value": "${GAME_STATE}","inline": true},
-                {"name": "Top Activity","value": "${TOP_ACTIVITY}","inline": false}
+                {"name": "Roblox CPU","value": "${LAST_CPU_PCT}%","inline": true},
+                {"name": "UDP Sockets","value": "${LAST_UDP}","inline": true}
             ],
             "image": {"url": "attachment://screen.png"}
         }
@@ -764,39 +752,7 @@ EOF
 }
 
 # ============================================================
-#  Screen classification  (UI dump based)
-# ============================================================
-detect_roblox_screen() {
-    get_ui_dump || { echo "UNKNOWN"; return; }
-    [ ! -f "$UI_DUMP_PATH" ] && { echo "UNKNOWN"; return; }
-
-    # Login screen
-    HAS_PW=0
-    grep -qE 'text="Password"' "$UI_DUMP_PATH" && HAS_PW=1
-    grep -qE 'resource-id="[^"]*edit_password' "$UI_DUMP_PATH" && HAS_PW=1
-    HAS_USER=0
-    grep -qE 'text="(Username|Email|username|email)"' "$UI_DUMP_PATH" && HAS_USER=1
-    HAS_BTN=0
-    grep -qE 'text="(Log ?In|Login|Sign ?In)"' "$UI_DUMP_PATH" && HAS_BTN=1
-    if [ "$HAS_PW" -eq 1 ] && [ "$HAS_USER" -eq 1 ] && [ "$HAS_BTN" -eq 1 ]; then
-        echo "LOGIN"; return
-    fi
-
-    # Roblox home screen (bottom navigation tabs)
-    HOME_HITS=0
-    grep -qE 'text="Home"'                             "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
-    grep -qE 'text="(Avatar|Marketplace|Charts|Create|Robux|More)"' "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
-    grep -qE 'content-desc="[^"]*(Home|Avatar|Marketplace|More)[^"]*"' "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
-
-    if [ "$HOME_HITS" -ge 2 ]; then
-        echo "HOME"; return
-    fi
-
-    echo "UNKNOWN"
-}
-
-# ============================================================
-#  Watchdog — real-time, combined UDP + CPU detection
+#  Watchdog — UDP + CPU only, no uiautomator in the loop
 # ============================================================
 watchdog() {
     PREVIOUS_INSTANCE_STATUS=$(get_instance_status)
@@ -804,10 +760,10 @@ watchdog() {
     PREVIOUS_USERNAME=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f1)
     PREVIOUS_USER_ID=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f2)
 
-    echo "Watchdog started (poll ${CHECK_INTERVAL}s, screen-check ${UI_CHECK_INTERVAL}s)."
+    echo "Watchdog started (poll ${CHECK_INTERVAL}s)."
+    echo "CPU in-game threshold: ${CPU_INGAME_THRESHOLD}%"
+    echo "Out-of-game grace: ${OUT_OF_GAME_GRACE}s"
     echo "Initial instance: $PREVIOUS_INSTANCE_STATUS"
-
-    SCREEN_STATE="UNKNOWN"
 
     while true; do
         NOW=$(/system/bin/date +%s)
@@ -818,8 +774,7 @@ watchdog() {
             if [ "$CURRENT_INSTANCE_STATUS" = "Closed" ]; then
                 echo "Roblox: Running -> Closed"
                 GAME_STATE="NOT_IN_GAME"
-                SCREEN_STATE="UNKNOWN"
-                UI_DUMP_TS=0
+                NOT_IN_GAME_STREAK=0
                 reset_cpu_sampling
                 if [ "$RECOVERY_RUNNING" -eq 0 ]; then
                     launch_instance
@@ -832,8 +787,7 @@ watchdog() {
             else
                 echo "Roblox: Closed -> Running"
                 GAME_STATE="UNKNOWN"
-                SCREEN_STATE="UNKNOWN"
-                UI_DUMP_TS=0
+                NOT_IN_GAME_STREAK=0
                 reset_cpu_sampling
             fi
             PREVIOUS_INSTANCE_STATUS="$CURRENT_INSTANCE_STATUS"
@@ -860,91 +814,50 @@ watchdog() {
             PREVIOUS_USER_ID="$CURRENT_USER_ID"
         fi
 
-        # ---- state reconciliation (UDP + CPU) ----
+        # ---- in-game detection (UDP + CPU, fast) ----
         if is_process_alive; then
-
             CPU_NOW=$(get_roblox_cpu_pct)
             UDP_NOW=0
             is_in_game_network && UDP_NOW=1
 
-            IN_GAME=0
-            [ "$CPU_NOW" -ge "$CPU_INGAME_THRESHOLD" ] && IN_GAME=1
-            [ "$UDP_NOW" -eq 1 ] && IN_GAME=1
+            LAST_UDP="$UDP_NOW"
 
-            if [ "$IN_GAME" -eq 1 ]; then
+            if is_in_game "$CPU_NOW" "$UDP_NOW"; then
                 if [ "$GAME_STATE" != "IN_GAME" ]; then
-                    echo "In-game (cpu=${CPU_NOW}% udp=${UDP_NOW})."
+                    echo "State -> IN_GAME (cpu=${CPU_NOW}% udp=${UDP_NOW})."
                 fi
                 GAME_STATE="IN_GAME"
                 NOT_IN_GAME_STREAK=0
-                SCREEN_STATE="IN_GAME"
             else
                 NOT_IN_GAME_STREAK=$((NOT_IN_GAME_STREAK + 1))
 
-                NEW_SCREEN="UNKNOWN"
-                if ! is_roblox_focused; then
-                    NEW_SCREEN="BACKGROUND"
-                else
-                    NEW_SCREEN=$(detect_roblox_screen)
+                if [ "$GAME_STATE" != "NOT_IN_GAME" ]; then
+                    echo "State -> NOT_IN_GAME (cpu=${CPU_NOW}% udp=${UDP_NOW})."
+                    GAME_STATE="NOT_IN_GAME"
                 fi
 
-                if [ "$NEW_SCREEN" != "$SCREEN_STATE" ]; then
-                    echo "Screen: $SCREEN_STATE -> $NEW_SCREEN (cpu=${CPU_NOW}%)"
-                    SCREEN_STATE="$NEW_SCREEN"
-                fi
-
-                case "$NEW_SCREEN" in
-                    LOGIN)
+                if [ "$NOT_IN_GAME_STREAK" -ge "$OUT_OF_GAME_GRACE" ]; then
+                    SINCE_JOIN=$((NOW - LAST_JOIN_TIME))
+                    if [ "$RECOVERY_RUNNING" -eq 0 ] \
+                       && [ "$SINCE_JOIN" -ge "$REJOIN_COOLDOWN" ]; then
+                        echo "Out of game for ${NOT_IN_GAME_STREAK}s — rejoining."
                         GAME_STATE="NOT_IN_GAME"
+                        send_join_intent
+                        GAME_STATE="JOINING"
                         NOT_IN_GAME_STREAK=0
-                        ;;
-
-                    HOME)
-                        GAME_STATE="NOT_IN_GAME"
-                        ELAPSED=$((NOW - LAST_JOIN_TIME))
-                        if [ "$RECOVERY_RUNNING" -eq 0 ] \
-                           && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                            echo "On Roblox home — re-joining."
-                            join_game
-                            wait_for_game_start
-                            UI_DUMP_TS=0
-                            NOT_IN_GAME_STREAK=0
-                        fi
-                        ;;
-
-                    BACKGROUND)
-                        # User switched away — leave Roblox alone.
-                        ;;
-
-                    *)
-                        # UNKNOWN — use the grace timer.
-                        if [ "$NOT_IN_GAME_STREAK" -ge "$NO_UDP_GRACE" ]; then
-                            ELAPSED=$((NOW - LAST_JOIN_TIME))
-                            if [ "$RECOVERY_RUNNING" -eq 0 ] \
-                               && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                                echo "Out of game for ${NOT_IN_GAME_STREAK}s (cpu=${CPU_NOW}%) — re-joining."
-                                GAME_STATE="NOT_IN_GAME"
-                                if ! is_roblox_focused; then
-                                    /system/bin/am start -n \
-                                        "$TARGET_PACKAGE/$TARGET_ACTIVITY" \
-                                        >/dev/null 2>&1
-                                    sleep 2
-                                fi
-                                send_join_intent
-                                GAME_STATE="JOINING"
-                                NOT_IN_GAME_STREAK=0
-                                UI_DUMP_TS=0
-                            fi
-                        fi
-                        ;;
-                esac
+                    fi
+                fi
             fi
-
         else
             GAME_STATE="NOT_IN_GAME"
-            SCREEN_STATE="UNKNOWN"
             NOT_IN_GAME_STREAK=0
             reset_cpu_sampling
+        fi
+
+        # ---- heartbeat status line ----
+        if [ $((NOW - LAST_STATUS_TS)) -ge "$STATUS_EVERY" ]; then
+            echo "[status] state=${GAME_STATE} cpu=${CPU_NOW:-0}% udp=${UDP_NOW:-0} streak=${NOT_IN_GAME_STREAK} since_join=$((NOW - LAST_JOIN_TIME))s"
+            LAST_STATUS_TS=$NOW
         fi
 
         sleep "$CHECK_INTERVAL"
@@ -960,6 +873,7 @@ echo "=============================="
 echo "Watchdog interval: ${CHECK_INTERVAL}s"
 echo "Discord report interval: ${REPORT_INTERVAL}s"
 echo "CPU in-game threshold: ${CPU_INGAME_THRESHOLD}%"
+echo "Out-of-game grace: ${OUT_OF_GAME_GRACE}s"
 echo "Auto game joining: Enabled"
 echo "Auto recovery: Enabled"
 echo "Auto login: $([ -f "$ACCOUNTS_FILE" ] && echo Enabled || echo Disabled)"
@@ -973,8 +887,14 @@ else
     U=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
     [ "$U" != "N/A" ] && echo "Existing account: $U"
 
-    if is_in_game_network; then
-        echo "Already in game (UDP active)."
+    CPU_NOW=$(get_roblox_cpu_pct)
+    sleep 1
+    CPU_NOW=$(get_roblox_cpu_pct)
+    UDP_NOW=0
+    is_in_game_network && UDP_NOW=1
+
+    if is_in_game "$CPU_NOW" "$UDP_NOW"; then
+        echo "Already in game (cpu=${CPU_NOW}% udp=${UDP_NOW})."
         GAME_STATE="IN_GAME"
     else
         echo "Roblox running but not in-game — joining."
