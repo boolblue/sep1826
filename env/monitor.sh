@@ -1,81 +1,44 @@
 #!/system/bin/sh
-# ============================================================
-#  Cloudphone Monitor v2
-#  - Real-time (1s) watchdog
-#  - UDP + CPU in-game detection
-#  - Fixed CPU subshell bug
-#  - Cached account detection
-# ============================================================
 
-# ----------------------- Configuration ----------------------
 WEBHOOK_URL="https://discord.com/api/webhooks/1478853919223451701/QBtFbDgqCs6xPrLLTjgCuzGyIT9uJpOD1LIubL5wIEF5Lm-On7wzyZ9UP2qMS2GmAnBK"
 
 TARGET_PACKAGE="free.nokaA"
 TARGET_ACTIVITY="com.roblox.client.startup.LauncherAliasMain"
-TARGET_RUNNING_ACTIVITY="com.roblox.client.ActivityNativeMain"
+TARGET_RUNNING_ACTIVITY="free.nokaA/com.roblox.client.ActivityNativeMain"
 
 ROBLOX_STORAGE="/data/data/free.nokaA/files/appData/LocalStorage/appStorage.json"
 ROBLOX_GAME_ID="1730877806"
 
 SCREEN_PATH="/data/local/tmp/screen.png"
-UI_DUMP_PATH="/data/local/tmp/ui.xml"
-ACCOUNTS_FILE="/data/local/tmp/account.txt"
 
 CURL="/data/data/com.termux/files/usr/bin/curl"
-PYTHON="/data/data/com.termux/files/usr/bin/python3"
 
-# Timing
-CHECK_INTERVAL=1          # watchdog poll target
+CHECK_INTERVAL=5
 REPORT_INTERVAL=300
-JOIN_WAIT=8
+
+JOIN_WAIT=10
 JOIN_TIMEOUT=45
-RECOVERY_WAIT=10
-REJOIN_COOLDOWN=30        # minimum seconds between join attempts
-OUT_OF_GAME_GRACE=15      # seconds of "out of game" before rejoining
-UI_CHECK_INTERVAL=3
-ACCOUNT_CACHE_TTL=10      # seconds before re-running account python
+RECOVERY_WAIT=15
+GAME_RECHECK_INTERVAL=60
 
-# Detection thresholds
-UDP_CHECK_ENABLED=1
-CPU_INGAME_THRESHOLD=25   # % of one core
-FOREGROUND_CHECK_ENABLED=1
-
-# Debug
-DETECTION_DEBUG=1
-STATUS_EVERY=5            # heartbeat interval (seconds)
-
-# ------------------------- State -----------------------------
 PREVIOUS_INSTANCE_STATUS=""
 PREVIOUS_ACCOUNT=""
+
 GAME_STATE="UNKNOWN"
 LAST_JOIN_TIME=0
 RECOVERY_RUNNING=0
-LOGIN_ATTEMPTED=0
-ACCOUNT_SEEN_THIS_SESSION=0
-NOT_IN_GAME_STREAK=0
-LAST_CPU_TICKS=0
-LAST_CPU_SAMPLE_TS=0
-LAST_CPU_PCT=0
-LAST_UDP=0
-LAST_STATUS_TS=0
-LAST_FOREGROUND_ACTIVITY="N/A"
-LAST_FOREGROUND_IS_ROBLOX=0
-LAST_DETECTION_REASON="N/A"
 
-# Cached account
-CACHED_ACCOUNT=""
-CACHED_ACCOUNT_TS=0
-
-# ============================================================
-#  System stat helpers
-# ============================================================
 get_cpu_usage() {
     CPU_LINE=$(top -n 1 -b 2>/dev/null | grep -i "cpu" | head -1)
+
     if [ -z "$CPU_LINE" ]; then
-        echo "N/A"; return
+        echo "N/A"
+        return
     fi
+
     TOTAL=$(echo "$CPU_LINE" | grep -o '[0-9]*%cpu' | head -1 | tr -d '%cpu')
     IDLE=$(echo "$CPU_LINE" | grep -o '[0-9]*%idle' | head -1 | tr -d '%idle')
+
     if [ -n "$TOTAL" ] && [ -n "$IDLE" ] && [ "$TOTAL" -gt 0 ] 2>/dev/null; then
         USED=$(( (TOTAL - IDLE) * 100 / TOTAL ))
         echo "${USED}%"
@@ -85,27 +48,49 @@ get_cpu_usage() {
 }
 
 get_cpu_temperature() {
-    for FILE in /sys/class/thermal/thermal_zone*/temp; do
-        [ -f "$FILE" ] || continue
-        VALUE=$(cat "$FILE" 2>/dev/null)
-        if [ -n "$VALUE" ] && [ "$VALUE" -gt 1000 ] 2>/dev/null; then
-            echo "$((VALUE / 1000))°C"; return
+    TEMP=""
+
+    for FILE in /sys/class/thermal/thermal_zone*/temp
+    do
+        if [ -f "$FILE" ]; then
+            VALUE=$(cat "$FILE" 2>/dev/null)
+
+            if [ -n "$VALUE" ] && [ "$VALUE" -gt 1000 ] 2>/dev/null; then
+                TEMP=$((VALUE / 1000))
+                break
+            fi
         fi
     done
-    echo "N/A"
+
+    if [ -n "$TEMP" ]; then
+        echo "${TEMP}°C"
+    else
+        echo "N/A"
+    fi
 }
 
 get_battery() {
     BATTERY_LEVEL=$(/system/bin/dumpsys battery 2>/dev/null | grep "level:" | head -1 | awk '{print $2}')
-    [ -n "$BATTERY_LEVEL" ] && echo "${BATTERY_LEVEL}%" || echo "N/A"
+
+    if [ -n "$BATTERY_LEVEL" ]; then
+        echo "${BATTERY_LEVEL}%"
+    else
+        echo "N/A"
+    fi
 }
 
 get_uptime() {
     UPTIME_SECONDS=$(awk '{print int($1)}' /proc/uptime 2>/dev/null)
-    [ -z "$UPTIME_SECONDS" ] && { echo "N/A"; return; }
+
+    if [ -z "$UPTIME_SECONDS" ]; then
+        echo "N/A"
+        return
+    fi
+
     DAYS=$((UPTIME_SECONDS / 86400))
     HOURS=$(((UPTIME_SECONDS % 86400) / 3600))
     MINUTES=$(((UPTIME_SECONDS % 3600) / 60))
+
     if [ "$DAYS" -gt 0 ]; then
         echo "${DAYS}d ${HOURS}h ${MINUTES}m"
     elif [ "$HOURS" -gt 0 ]; then
@@ -117,332 +102,125 @@ get_uptime() {
 
 get_storage() {
     STORAGE_INFO=$(/system/bin/df -h /data 2>/dev/null | tail -1)
+
     if [ -n "$STORAGE_INFO" ]; then
         USED=$(echo "$STORAGE_INFO" | awk '{print $3}')
         TOTAL=$(echo "$STORAGE_INFO" | awk '{print $2}')
         PERCENT=$(echo "$STORAGE_INFO" | awk '{print $5}')
+
         echo "${USED} / ${TOTAL} (${PERCENT})"
     else
         echo "N/A"
     fi
 }
 
-get_ram() {
-    TOTAL_KB=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null)
-    AVAIL_KB=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null)
-
-    if [ -z "$TOTAL_KB" ] || [ -z "$AVAIL_KB" ]; then
-        echo "N/A"
-        return
-    fi
-
-    if [ "$TOTAL_KB" -le 0 ] 2>/dev/null; then
-        echo "N/A"
-        return
-    fi
-
-    [ "$AVAIL_KB" -lt 0 ] 2>/dev/null && AVAIL_KB=0
-    [ "$AVAIL_KB" -gt "$TOTAL_KB" ] 2>/dev/null && AVAIL_KB="$TOTAL_KB"
-
-    USED_KB=$((TOTAL_KB - AVAIL_KB))
-    TOTAL_MB=$((TOTAL_KB / 1024))
-    USED_MB=$((USED_KB / 1024))
-
-    if [ "$TOTAL_MB" -le 0 ]; then
-        echo "N/A"
-        return
-    fi
-
-    PCT=$((USED_MB * 100 / TOTAL_MB))
-    [ "$PCT" -lt 0 ] 2>/dev/null && PCT=0
-    [ "$PCT" -gt 100 ] 2>/dev/null && PCT=100
-
-    echo "${USED_MB} MB / ${TOTAL_MB} MB (${PCT}%)"
-}
-
-# ============================================================
-#  Process detection
-# ============================================================
-is_process_alive() {
-    /system/bin/pidof "$TARGET_PACKAGE" >/dev/null 2>&1
-}
-
-get_roblox_pid() {
-    /system/bin/pidof "$TARGET_PACKAGE" 2>/dev/null | awk '{print $1}'
+is_instance_running() {
+    /system/bin/dumpsys activity activities 2>/dev/null | grep -q "$TARGET_RUNNING_ACTIVITY"
 }
 
 get_instance_status() {
-    if is_process_alive; then
+    if is_instance_running; then
         echo "Running"
     else
         echo "Closed"
     fi
 }
 
-# ============================================================
-#  Foreground activity detection
-# ============================================================
-get_foreground_activity() {
-    CURRENT=$(/system/bin/dumpsys activity activities 2>/dev/null | grep -m 1 -E 'mResumedActivity|mCurrentFocus')
-
-    if [ -z "$CURRENT" ]; then
-        CURRENT=$(/system/bin/dumpsys window windows 2>/dev/null | grep -m 1 -E 'mCurrentFocus|mFocusedApp')
-    fi
-
-    if [ -z "$CURRENT" ]; then
-        echo "N/A"
-        return
-    fi
-
-    COMPONENT=$(echo "$CURRENT" | grep -oE "${TARGET_PACKAGE}/[^ ]+" | head -1)
-
-    if [ -n "$COMPONENT" ]; then
-        echo "$COMPONENT"
-    else
-        echo "$CURRENT"
-    fi
-}
-
-is_roblox_foreground() {
-    FOREGROUND=$(get_foreground_activity)
-    LAST_FOREGROUND_ACTIVITY="$FOREGROUND"
-
-    if [ -z "$FOREGROUND" ] || [ "$FOREGROUND" = "N/A" ]; then
-        LAST_FOREGROUND_IS_ROBLOX=0
-        return 1
-    fi
-
-    case "$FOREGROUND" in
-        "$TARGET_PACKAGE/"*)
-            LAST_FOREGROUND_IS_ROBLOX=1
-            return 0
-            ;;
-        *)
-            LAST_FOREGROUND_IS_ROBLOX=0
-            return 1
-            ;;
-    esac
-}
-
-# ============================================================
-#  In-game detection  (UDP + CPU)
-# ============================================================
-get_roblox_uid() {
-    stat -c %u "/data/data/$TARGET_PACKAGE" 2>/dev/null
-}
-
-count_conns_for_uid() {
-    FILE="$1"; UID="$2"
-    [ -z "$UID" ] && { echo 0; return; }
-    [ -r "$FILE" ] || { echo 0; return; }
-    awk -v u="$UID" '$8 == u {c++} END {print c+0}' "$FILE" 2>/dev/null
-}
-
-is_in_game_network() {
-    [ "$UDP_CHECK_ENABLED" -eq 1 ] || return 1
-    UID=$(get_roblox_uid)
-    [ -z "$UID" ] && return 1
-    [ "$(count_conns_for_uid /proc/net/udp  "$UID")" -gt 0 ] && return 0
-    [ "$(count_conns_for_uid /proc/net/udp6 "$UID")" -gt 0 ] && return 0
-    return 1
-}
-
-# Updates global ROBLOX_CPU_PCT. Do NOT call in a subshell.
-update_roblox_cpu_pct() {
-    NOW=$(/system/bin/date +%s)
-    P=$(get_roblox_pid)
-
-    if [ -z "$P" ] || [ ! -r "/proc/$P/stat" ]; then
-        LAST_CPU_TICKS=0
-        LAST_CPU_SAMPLE_TS=0
-        ROBLOX_CPU_PCT=0
-        return
-    fi
-
-    TICKS=$(awk '{print $14 + $15}' "/proc/$P/stat" 2>/dev/null)
-    [ -z "$TICKS" ] && TICKS=0
-
-    if [ "$LAST_CPU_SAMPLE_TS" -eq 0 ]; then
-        LAST_CPU_TICKS="$TICKS"
-        LAST_CPU_SAMPLE_TS="$NOW"
-        ROBLOX_CPU_PCT=0
-        return
-    fi
-
-    DT=$((NOW - LAST_CPU_SAMPLE_TS))
-    if [ "$DT" -le 0 ]; then
-        ROBLOX_CPU_PCT="$LAST_CPU_PCT"
-        return
-    fi
-
-    DD=$((TICKS - LAST_CPU_TICKS))
-    [ "$DD" -lt 0 ] && DD=0
-
-    LAST_CPU_TICKS="$TICKS"
-    LAST_CPU_SAMPLE_TS="$NOW"
-
-    ROBLOX_CPU_PCT=$((DD / DT))
-    LAST_CPU_PCT="$ROBLOX_CPU_PCT"
-}
-
-reset_cpu_sampling() {
-    LAST_CPU_TICKS=0
-    LAST_CPU_SAMPLE_TS=0
-    LAST_CPU_PCT=0
-    ROBLOX_CPU_PCT=0
-}
-
-is_in_game() {
-    CPU=$1
-    UDP=$2
-
-    if [ "$FOREGROUND_CHECK_ENABLED" -eq 1 ]; then
-        if ! is_roblox_foreground; then
-            LAST_DETECTION_REASON="Roblox is not foreground"
-            return 1
-        fi
-    fi
-
-    if [ "$UDP" -eq 1 ]; then
-        LAST_DETECTION_REASON="Roblox foreground + UDP detected"
-        return 0
-    fi
-
-    if [ "$CPU" -ge "$CPU_INGAME_THRESHOLD" ] 2>/dev/null; then
-        LAST_DETECTION_REASON="Roblox foreground + CPU ${CPU}% >= ${CPU_INGAME_THRESHOLD}%"
-        return 0
-    fi
-
-    LAST_DETECTION_REASON="Roblox foreground but no UDP and CPU ${CPU}% < ${CPU_INGAME_THRESHOLD}%"
-    return 1
-}
-
-print_detection_debug() {
-    [ "$DETECTION_DEBUG" -eq 1 ] || return
-    echo "[detect] foreground=${LAST_FOREGROUND_ACTIVITY} roblox_foreground=${LAST_FOREGROUND_IS_ROBLOX} cpu=${ROBLOX_CPU_PCT:-0}% udp=${LAST_UDP} state=${GAME_STATE} reason=${LAST_DETECTION_REASON}"
-}
-
-# ============================================================
-#  Cached account detection
-# ============================================================
-get_roblox_account_raw() {
+get_roblox_account() {
     if [ ! -f "$ROBLOX_STORAGE" ]; then
         echo "N/A|N/A"
         return
     fi
 
-    RESULT=$("$PYTHON" - "$ROBLOX_STORAGE" 2>/dev/null <<'PY'
-import sys, json, re
+    RESULT=$(python3 - "$ROBLOX_STORAGE" 2>/dev/null <<'PY'
+import sys
+import json
+import re
 
 path = sys.argv[1]
+
 try:
-    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        raw = f.read()
-except Exception:
-    print("N/A|N/A"); sys.exit(0)
+    with open(path, "r", encoding="utf-8") as f:
+        data = f.read()
+except:
+    print("N/A|N/A")
+    sys.exit()
 
 accounts = []
-seen = set()
 
-def push(username, uid, show_picker=False, sign_in=0, sign_out=None):
-    if not username or uid is None:
-        return
-    uid = str(uid)
-    if uid in seen:
-        return
-    seen.add(uid)
+patterns = [
+    r'username\\":\\"([^"]*)\\".*?userIdentifier\\":\\"([^"]*)\\".*?userId\\":\\"([0-9]+)\\"',
+    r'userIdentifier\\":\\"([^"]*)\\".*?displayName\\":\\"([^"]*)\\".*?userId\\":\\"([0-9]+)\\"'
+]
+
+for match in re.finditer(patterns[0], data):
+    username = match.group(1)
+    identifier = match.group(2)
+    user_id = match.group(3)
+
+    start = max(0, match.start() - 1000)
+    end = min(len(data), match.end() + 1000)
+
+    section = data[start:end]
+
+    picker = re.search(r'showInAccountPicker\\":(true|false)', section)
+    signed_out = re.search(r'signOutTimestamp\\":([0-9]+)', section)
+    signed_in = re.search(r'signInTimestamp\\":([0-9]+)', section)
+
+    show_picker = picker.group(1) == "true" if picker else False
+    sign_out = int(signed_out.group(1)) if signed_out else None
+    sign_in = int(signed_in.group(1)) if signed_in else 0
+
+    if sign_out is not None:
+        continue
+
     accounts.append({
-        "username": str(username),
-        "user_id": uid,
-        "picker": bool(show_picker),
-        "sign_in": int(sign_in or 0),
-        "sign_out": sign_out,
+        "username": username,
+        "user_id": user_id,
+        "picker": show_picker,
+        "sign_in": sign_in
     })
 
-def add_from_dict(d):
-    if not isinstance(d, dict):
-        return
-    uid = (d.get('userId') or d.get('UserId')
-           or d.get('user_id') or d.get('userID'))
-    uname = (d.get('username') or d.get('Username')
-             or d.get('userIdentifier') or d.get('displayName')
-             or d.get('DisplayName') or d.get('name'))
-    if uid is None or not uname:
-        return
-    push(
-        uname, uid,
-        show_picker=d.get('showInAccountPicker', False),
-        sign_in=d.get('signInTimestamp') or 0,
-        sign_out=d.get('signOutTimestamp'),
-    )
+if not accounts:
+    for match in re.finditer(patterns[1], data):
+        identifier = match.group(1)
+        user_id = match.group(3)
 
-def walk(obj, depth=0):
-    if depth > 25:
-        return
-    if isinstance(obj, dict):
-        add_from_dict(obj)
-        for v in obj.values():
-            walk(v, depth + 1)
-    elif isinstance(obj, list):
-        for item in obj:
-            walk(item, depth + 1)
-    elif isinstance(obj, str):
-        s = obj.strip()
-        if not s:
-            return
-        candidates = [s]
-        if '\\"' in s:
-            candidates.append(s.replace('\\"', '"'))
-        if '\\/' in s:
-            candidates.append(s.replace('\\/', '/'))
-        for c in candidates:
-            if not (c.startswith('{') or c.startswith('[')):
-                continue
-            try:
-                walk(json.loads(c), depth + 1)
-                break
-            except Exception:
-                continue
+        start = max(0, match.start() - 1000)
+        end = min(len(data), match.end() + 1000)
 
-try:
-    outer = json.loads(raw)
-    walk(outer)
-except Exception:
-    pass
+        section = data[start:end]
+
+        picker = re.search(r'showInAccountPicker\\":(true|false)', section)
+        signed_out = re.search(r'signOutTimestamp\\":([0-9]+)', section)
+        signed_in = re.search(r'signInTimestamp\\":([0-9]+)', section)
+
+        show_picker = picker.group(1) == "true" if picker else False
+        sign_out = int(signed_out.group(1)) if signed_out else None
+        sign_in = int(signed_in.group(1)) if signed_in else 0
+
+        if sign_out is not None:
+            continue
+
+        accounts.append({
+            "username": identifier,
+            "user_id": user_id,
+            "picker": show_picker,
+            "sign_in": sign_in
+        })
 
 if not accounts:
-    normalized = raw.replace('\\"', '"').replace('\\/', '/')
-    obj_re = re.compile(r'\{[^{}]{0,800}\}')
-    for m in obj_re.finditer(normalized):
-        blob = m.group(0)
-        uid_m = re.search(r'"(?:userId|user_id|userID)"\s*:\s*"?(\d+)"?', blob)
-        name_m = re.search(
-            r'"(?:username|userIdentifier|displayName)"\s*:\s*"([^"]+)"',
-            blob)
-        if uid_m and name_m:
-            picker_m = re.search(
-                r'"showInAccountPicker"\s*:\s*(true|false)', blob)
-            signout_m = re.search(r'"signOutTimestamp"\s*:\s*(\d+)', blob)
-            signin_m = re.search(r'"signInTimestamp"\s*:\s*(\d+)', blob)
-            push(
-                name_m.group(1), uid_m.group(1),
-                show_picker=(picker_m and picker_m.group(1) == 'true'),
-                sign_in=(int(signin_m.group(1)) if signin_m else 0),
-                sign_out=(int(signout_m.group(1)) if signout_m else None),
-            )
+    print("N/A|N/A")
+    sys.exit()
 
-accounts = [a for a in accounts if a["sign_out"] is None]
+picker_accounts = [a for a in accounts if a["picker"]]
 
-if not accounts:
-    print("N/A|N/A"); sys.exit(0)
-
-picker = [a for a in accounts if a["picker"]]
-if picker:
-    sel = picker[-1]
+if picker_accounts:
+    selected = picker_accounts[-1]
 else:
-    sel = sorted(accounts, key=lambda x: x["sign_in"], reverse=True)[0]
+    selected = sorted(accounts, key=lambda x: x["sign_in"], reverse=True)[0]
 
-print(f"{sel['username']}|{sel['user_id']}")
+print(selected["username"] + "|" + selected["user_id"])
 PY
 )
 
@@ -453,390 +231,290 @@ PY
     fi
 }
 
-# Returns cached account, refreshing at most every ACCOUNT_CACHE_TTL seconds.
-get_roblox_account() {
-    NOW=$(/system/bin/date +%s)
-    if [ -n "$CACHED_ACCOUNT" ] \
-       && [ $((NOW - CACHED_ACCOUNT_TS)) -lt "$ACCOUNT_CACHE_TTL" ]; then
-        echo "$CACHED_ACCOUNT"
-        return
-    fi
-
-    CACHED_ACCOUNT=$(get_roblox_account_raw)
-    CACHED_ACCOUNT_TS=$NOW
-    echo "$CACHED_ACCOUNT"
-}
-
-# ============================================================
-#  UI automation helpers  (auto-login only)
-# ============================================================
-UI_DUMP_TS=0
-
-ui_dump() {
-    /system/bin/uiautomator dump "$UI_DUMP_PATH" >/dev/null 2>&1
-    UI_DUMP_TS=$(/system/bin/date +%s)
-    [ -f "$UI_DUMP_PATH" ]
-}
-
-ui_find_fields() {
-    "$PYTHON" - "$UI_DUMP_PATH" <<'PY'
-import sys, re
-import xml.etree.ElementTree as ET
-
-try:
-    tree = ET.parse(sys.argv[1])
-except Exception:
-    sys.exit(0)
-
-def center(bounds):
-    m = re.findall(r'\d+', bounds or '')
-    if len(m) == 4:
-        return (int(m[0]) + int(m[2])) // 2, (int(m[1]) + int(m[3])) // 2
-    return None
-
-username = password = login = None
-edit_fields = []
-
-for node in tree.iter('node'):
-    cls   = node.get('class', '') or ''
-    text  = (node.get('text', '') or '').strip()
-    desc  = (node.get('content-desc', '') or '').strip()
-    rid   = node.get('resource-id', '') or ''
-    bnd   = node.get('bounds', '')
-    combo = (text + ' ' + desc + ' ' + rid).lower()
-
-    if 'EditText' in cls:
-        edit_fields.append((combo, bnd))
-
-    if login is None and 'EditText' not in cls:
-        if (re.search(r'\blog ?in\b', combo)
-                or 'sign in' in combo or 'signin' in combo
-                or 'btn_login' in combo or 'button_login' in combo):
-            c = center(bnd)
-            if c: login = c
-
-for combo, bnd in edit_fields:
-    c = center(bnd)
-    if not c: continue
-    if username is None and re.search(r'user|email|name', combo):
-        username = c
-        continue
-    if password is None and re.search(r'pass', combo):
-        password = c
-        continue
-
-if not username and not password and len(edit_fields) >= 2:
-    c0 = center(edit_fields[0][1]); c1 = center(edit_fields[1][1])
-    username = username or c0
-    password = password or c1
-elif username and not password:
-    for combo, bnd in edit_fields:
-        c = center(bnd)
-        if c and c != username:
-            password = c
-            break
-elif password and not username:
-    for combo, bnd in edit_fields:
-        c = center(bnd)
-        if c and c != password:
-            username = c
-            break
-
-if username: print(f"USERNAME {username[0]} {username[1]}")
-if password: print(f"PASSWORD {password[0]} {password[1]}")
-if login:    print(f"LOGIN {login[0]} {login[1]}")
-PY
-}
-
-is_login_screen() {
-    ui_dump || return 1
-    [ ! -f "$UI_DUMP_PATH" ] && return 1
-
-    HAS_PW=0
-    grep -qE 'text="Password"' "$UI_DUMP_PATH" && HAS_PW=1
-    grep -qE 'resource-id="[^"]*edit_password' "$UI_DUMP_PATH" && HAS_PW=1
-    grep -qE 'password="true"' "$UI_DUMP_PATH" && HAS_PW=1
-
-    HAS_USER=0
-    grep -qE 'text="(Username|Email|username|email)"' "$UI_DUMP_PATH" && HAS_USER=1
-    grep -qE 'resource-id="[^"]*edit_username' "$UI_DUMP_PATH" && HAS_USER=1
-
-    HAS_BTN=0
-    grep -qE 'text="(Log ?In|Login|Sign ?In)"' "$UI_DUMP_PATH" && HAS_BTN=1
-    grep -qE 'resource-id="[^"]*(btn_login|button_login)' "$UI_DUMP_PATH" && HAS_BTN=1
-
-    [ "$HAS_PW" -eq 1 ] && [ "$HAS_USER" -eq 1 ] && [ "$HAS_BTN" -eq 1 ]
-}
-
-input_escape() {
-    echo "$1" | sed 's/ /%s/g'
-}
-
-auto_login() {
-    if [ ! -f "$ACCOUNTS_FILE" ]; then
-        echo "Auto-login: $ACCOUNTS_FILE not found."
-        return 1
-    fi
-    LINE=$(head -n 1 "$ACCOUNTS_FILE")
-    [ -z "$LINE" ] && { echo "Auto-login: accounts file is empty."; return 1; }
-    USERNAME=$(echo "$LINE" | cut -d: -f1)
-    PASSWORD=$(echo "$LINE" | cut -d: -f2-)
-    [ -z "$USERNAME" ] && return 1
-    [ -z "$PASSWORD" ] && return 1
-
-    echo "Auto-login: trying account '$USERNAME'"
-    ui_dump || { echo "Auto-login: uiautomator dump failed."; return 1; }
-
-    FIELDS=$(ui_find_fields)
-    if [ -z "$FIELDS" ]; then
-        echo "Auto-login: could not locate fields."
-        return 1
-    fi
-
-    echo "$FIELDS" | while read -r TYPE X Y; do
-        case "$TYPE" in
-            USERNAME)
-                /system/bin/input tap "$X" "$Y"
-                sleep 1
-                /system/bin/input text "$(input_escape "$USERNAME")"
-                sleep 1
-                ;;
-            PASSWORD)
-                /system/bin/input tap "$X" "$Y"
-                sleep 1
-                /system/bin/input text "$(input_escape "$PASSWORD")"
-                sleep 1
-                ;;
-            LOGIN)
-                /system/bin/input tap "$X" "$Y"
-                echo "Auto-login: tapped login button."
-                ;;
-        esac
-    done
-
-    if ! echo "$FIELDS" | grep -q '^LOGIN '; then
-        echo "Auto-login: no login button, sending ENTER."
-        /system/bin/input keyevent 66
-    fi
-
-    return 0
-}
-
-# ============================================================
-#  Launch / join
-# ============================================================
 launch_instance() {
-    ACCOUNT_SEEN_THIS_SESSION=0
-    LOGIN_ATTEMPTED=0
-    UI_DUMP_TS=0
-    reset_cpu_sampling
-    CACHED_ACCOUNT=""
-    CACHED_ACCOUNT_TS=0
-
-    echo "=========================================="
-    echo "[startup] Roblox instance is not running."
-    echo "[startup] Launching $TARGET_PACKAGE..."
-    echo "=========================================="
+    echo "Launching $TARGET_PACKAGE..."
 
     /system/bin/am start -n "$TARGET_PACKAGE/$TARGET_ACTIVITY" >/dev/null 2>&1
-    AM_RESULT=$?
 
-    echo "[startup] am start exit code: $AM_RESULT"
-
-    if [ "$AM_RESULT" -ne 0 ]; then
-        echo "[startup] Failed to launch Roblox."
-        return 1
-    fi
+    echo "Waiting for Roblox instance..."
 
     COUNT=0
-    while [ "$COUNT" -lt 30 ]; do
-        if is_process_alive; then
-            echo "[startup] Roblox process started."
-            echo "[startup] PID: $(get_roblox_pid)"
+
+    while [ "$COUNT" -lt 30 ]
+    do
+        if is_instance_running; then
+            echo "Roblox instance started."
             return 0
         fi
+
         sleep 1
         COUNT=$((COUNT + 1))
     done
 
-    echo "[startup] ERROR: Roblox process did not start."
+    echo "Roblox instance failed to start."
     return 1
 }
 
 wait_for_account() {
     echo "Waiting for Roblox account..."
-    COUNT=0
-    while [ "$COUNT" -lt 60 ]; do
-        CACHED_ACCOUNT_TS=0
-        ACCOUNT_DATA=$(get_roblox_account)
-        U=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
-        if [ -n "$U" ] && [ "$U" != "N/A" ]; then
-            ACCOUNT_SEEN_THIS_SESSION=1
-            echo "Roblox account detected: $U"
-            return 0
-        fi
 
-        if [ "$ACCOUNT_SEEN_THIS_SESSION" -eq 0 ] \
-           && [ "$LOGIN_ATTEMPTED" -eq 0 ] \
-           && [ "$COUNT" -ge 5 ]; then
-            if is_login_screen; then
-                echo "Login screen detected (no prior session)."
-                auto_login
-                LOGIN_ATTEMPTED=1
-            fi
+    COUNT=0
+
+    while [ "$COUNT" -lt 30 ]
+    do
+        ACCOUNT_DATA=$(get_roblox_account)
+
+        ROBLOX_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
+        ROBLOX_USER_ID=$(echo "$ACCOUNT_DATA" | cut -d'|' -f2)
+
+        if [ -n "$ROBLOX_USERNAME" ] && [ "$ROBLOX_USERNAME" != "N/A" ]; then
+            echo "Roblox account detected: $ROBLOX_USERNAME ($ROBLOX_USER_ID)"
+            return 0
         fi
 
         sleep 1
         COUNT=$((COUNT + 1))
     done
+
     echo "Roblox account was not detected."
     return 1
 }
 
-send_join_intent() {
+join_game() {
+    if ! is_instance_running; then
+        echo "Cannot join game because Roblox is not running."
+        return 1
+    fi
+
+    echo "Waiting ${JOIN_WAIT} seconds before game join..."
+    sleep "$JOIN_WAIT"
+
+    if ! is_instance_running; then
+        echo "Roblox stopped before game join."
+        return 1
+    fi
+
+    echo "Joining Roblox game: $ROBLOX_GAME_ID"
+
     /system/bin/am start \
         -a android.intent.action.VIEW \
         -d "roblox://placeId=$ROBLOX_GAME_ID" \
         >/dev/null 2>&1
-    LAST_JOIN_TIME=$(/system/bin/date +%s)
-    UI_DUMP_TS=0
-}
 
-join_game() {
-    if ! is_process_alive; then
-        echo "Cannot join: Roblox is not running."
-        return 1
-    fi
-    echo "Waiting ${JOIN_WAIT}s before game join..."
-    sleep "$JOIN_WAIT"
-    if ! is_process_alive; then
-        echo "Roblox stopped before game join."
-        return 1
-    fi
-    echo "Joining Roblox game: $ROBLOX_GAME_ID"
-    send_join_intent
+    LAST_JOIN_TIME=$(/system/bin/date +%s)
     GAME_STATE="JOINING"
-    echo "Game join intent sent."
+
+    echo "Game join command sent."
+
     return 0
 }
 
 wait_for_game_start() {
-    echo "Waiting for game connection..."
+    echo "Waiting for game to start..."
+
     COUNT=0
-    while [ "$COUNT" -lt "$JOIN_TIMEOUT" ]; do
-        if ! is_process_alive; then
-            echo "Roblox died during join."
+
+    while [ "$COUNT" -lt "$JOIN_TIMEOUT" ]
+    do
+        if ! is_instance_running; then
+            echo "Roblox instance disappeared while joining."
             GAME_STATE="NOT_IN_GAME"
             return 1
-        fi
-
-        update_roblox_cpu_pct
-        CPU_NOW="$ROBLOX_CPU_PCT"
-        UDP_NOW=0
-        is_in_game_network && UDP_NOW=1
-
-        if is_in_game "$CPU_NOW" "$UDP_NOW"; then
-            GAME_STATE="IN_GAME"
-            echo "Connected (cpu=${CPU_NOW}% udp=${UDP_NOW})."
-            return 0
         fi
 
         sleep 1
         COUNT=$((COUNT + 1))
     done
-    GAME_STATE="JOINING"
-    echo "Join window elapsed without signal."
+
+    GAME_STATE="IN_GAME"
+
+    echo "Game join window completed."
     return 0
 }
 
-start_and_join() {
-    if ! is_process_alive; then
-        launch_instance || return 1
-    fi
-    wait_for_account || return 1
-    join_game || return 1
-    wait_for_game_start
-    return 0
-}
-
-# ============================================================
-#  Recovery
-# ============================================================
 force_rejoin() {
-    [ "$RECOVERY_RUNNING" -eq 1 ] && return 0
+    if [ "$RECOVERY_RUNNING" -eq 1 ]; then
+        return
+    fi
+
     RECOVERY_RUNNING=1
 
     echo "=============================="
     echo "ROBLOX GAME RECOVERY"
     echo "=============================="
-    echo "Waiting ${RECOVERY_WAIT}s..."
+
+    echo "Waiting ${RECOVERY_WAIT} seconds before recovery..."
     sleep "$RECOVERY_WAIT"
 
-    if ! is_process_alive; then
-        echo "Roblox is closed — relaunching."
-        launch_instance || { RECOVERY_RUNNING=0; return 1; }
-        wait_for_account || { RECOVERY_RUNNING=0; return 1; }
-        join_game || { RECOVERY_RUNNING=0; return 1; }
+    if ! is_instance_running; then
+        echo "Roblox instance is closed."
+        echo "Launching Roblox..."
+
+        launch_instance
+
+        if [ $? -ne 0 ]; then
+            echo "Failed to launch Roblox."
+            RECOVERY_RUNNING=0
+            return 1
+        fi
+
+        wait_for_account
+
+        if [ $? -ne 0 ]; then
+            echo "Account not detected after launch."
+            RECOVERY_RUNNING=0
+            return 1
+        fi
+
+        join_game
         wait_for_game_start
+
         RECOVERY_RUNNING=0
         return 0
     fi
 
-    echo "Roblox running — re-sending join intent."
-    send_join_intent
+    echo "Roblox instance is still running."
+    echo "Sending game join command again..."
+
+    /system/bin/am start \
+        -a android.intent.action.VIEW \
+        -d "roblox://placeId=$ROBLOX_GAME_ID" \
+        >/dev/null 2>&1
+
+    LAST_JOIN_TIME=$(/system/bin/date +%s)
     GAME_STATE="JOINING"
+
     sleep "$JOIN_TIMEOUT"
 
-    update_roblox_cpu_pct
-    CPU_NOW="$ROBLOX_CPU_PCT"
-    UDP_NOW=0
-    is_in_game_network && UDP_NOW=1
-    if is_in_game "$CPU_NOW" "$UDP_NOW"; then
+    if is_instance_running; then
         GAME_STATE="IN_GAME"
+        echo "Game rejoin command completed."
         RECOVERY_RUNNING=0
         return 0
     fi
 
-    if ! is_process_alive; then
-        echo "Roblox died — relaunching cleanly."
-        /system/bin/am force-stop "$TARGET_PACKAGE" >/dev/null 2>&1
-        sleep 3
-        launch_instance || { RECOVERY_RUNNING=0; return 1; }
-        wait_for_account || { RECOVERY_RUNNING=0; return 1; }
-        join_game || { RECOVERY_RUNNING=0; return 1; }
-        wait_for_game_start
+    echo "Game rejoin did not keep Roblox running."
+    echo "Restarting Roblox instance..."
+
+    /system/bin/am force-stop "$TARGET_PACKAGE" >/dev/null 2>&1
+
+    sleep 3
+
+    launch_instance
+
+    if [ $? -ne 0 ]; then
+        echo "Roblox relaunch failed."
+        RECOVERY_RUNNING=0
+        return 1
     fi
 
+    wait_for_account
+
+    if [ $? -ne 0 ]; then
+        echo "Account detection failed after relaunch."
+        RECOVERY_RUNNING=0
+        return 1
+    fi
+
+    join_game
+    wait_for_game_start
+
     RECOVERY_RUNNING=0
+
     return 0
 }
 
-# ============================================================
-#  Discord reporting
-# ============================================================
+check_game_state() {
+    if ! is_instance_running; then
+        GAME_STATE="NOT_IN_GAME"
+        return 1
+    fi
+
+    if [ "$GAME_STATE" = "UNKNOWN" ]; then
+        return 0
+    fi
+
+    if [ "$GAME_STATE" = "JOINING" ]; then
+        return 0
+    fi
+
+    if [ "$GAME_STATE" = "IN_GAME" ]; then
+        return 0
+    fi
+
+    return 0
+}
+
+start_and_join() {
+    if ! is_instance_running; then
+        launch_instance
+
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+    fi
+
+    wait_for_account
+
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    join_game
+
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+
+    wait_for_game_start
+
+    return 0
+}
+
 send_report() {
     echo "Collecting report data..."
+
     UNIX_TIME=$(/system/bin/date +%s)
     DISCORD_TIME="<t:${UNIX_TIME}:F>"
 
     CPU_PERCENT=$(get_cpu_usage)
-    RAM_INFO=$(get_ram)
+
+    RAM_TOTAL=$(/system/bin/free -m 2>/dev/null | awk '/Mem:/ {print $2}')
+    RAM_USED=$(/system/bin/free -m 2>/dev/null | awk '/Mem:/ {print $3}')
+
+    if [ -n "$RAM_TOTAL" ] && [ -n "$RAM_USED" ]; then
+        RAM_PERCENT=$((RAM_USED * 100 / RAM_TOTAL))
+        RAM_INFO="${RAM_USED} MB / ${RAM_TOTAL} MB (${RAM_PERCENT}%)"
+    else
+        RAM_INFO="N/A"
+    fi
+
     TEMPERATURE=$(get_cpu_temperature)
     BATTERY=$(get_battery)
     STORAGE=$(get_storage)
     UPTIME=$(get_uptime)
+
     APP_STATUS=$(get_instance_status)
 
-    CACHED_ACCOUNT_TS=0
     ACCOUNT_DATA=$(get_roblox_account)
+
     ROBLOX_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
     ROBLOX_USER_ID=$(echo "$ACCOUNT_DATA" | cut -d'|' -f2)
-    [ -z "$ROBLOX_USERNAME" ] && ROBLOX_USERNAME="N/A"
-    [ -z "$ROBLOX_USER_ID" ]  && ROBLOX_USER_ID="N/A"
 
-    echo "Account: $ROBLOX_USERNAME ($ROBLOX_USER_ID)"
+    if [ -z "$ROBLOX_USERNAME" ]; then
+        ROBLOX_USERNAME="N/A"
+    fi
+
+    if [ -z "$ROBLOX_USER_ID" ]; then
+        ROBLOX_USER_ID="N/A"
+    fi
+
+    echo "Roblox Account: ${ROBLOX_USERNAME}"
+    echo "Roblox User ID: ${ROBLOX_USER_ID}"
     echo "Taking screenshot..."
+
     /system/bin/screencap -p "$SCREEN_PATH" >/dev/null 2>&1
+
     if [ ! -f "$SCREEN_PATH" ]; then
         echo "Screenshot failed."
         return
@@ -857,10 +535,7 @@ send_report() {
                 {"name": "Battery","value": "${BATTERY}","inline": true},
                 {"name": "Storage","value": "${STORAGE}","inline": true},
                 {"name": "Uptime","value": "${UPTIME}","inline": true},
-                {"name": "Instance","value": "${APP_STATUS}","inline": true},
-                {"name": "Game State","value": "${GAME_STATE}","inline": true},
-                {"name": "Roblox CPU","value": "${LAST_CPU_PCT}%","inline": true},
-                {"name": "UDP Sockets","value": "${LAST_UDP}","inline": true}
+                {"name": "Instance","value": "${APP_STATUS}","inline": true}
             ],
             "image": {"url": "attachment://screen.png"}
         }
@@ -870,221 +545,194 @@ EOF
 )
 
     echo "Sending report to Discord..."
-    CURL_RESULT=$("$CURL" -sS -X POST "$WEBHOOK_URL" \
+
+    CURL_RESULT=$("$CURL" -sS \
+        -X POST \
+        "$WEBHOOK_URL" \
         -F "payload_json=${PAYLOAD}" \
-        -F "file=@${SCREEN_PATH};filename=screen.png" 2>&1)
+        -F "file=@${SCREEN_PATH};filename=screen.png" \
+        2>&1)
+
     CURL_EXIT=$?
 
     if [ "$CURL_EXIT" -eq 0 ]; then
-        echo "Report sent."
+        echo "Discord response: ${CURL_RESULT}"
+        echo "Report sent successfully."
     else
-        echo "Discord upload failed: $CURL_RESULT"
+        echo "Discord upload failed."
+        echo "curl error: ${CURL_RESULT}"
     fi
 }
 
-# ============================================================
-#  Watchdog
-# ============================================================
 watchdog() {
     PREVIOUS_INSTANCE_STATUS=$(get_instance_status)
-    CACHED_ACCOUNT_TS=0
     PREVIOUS_ACCOUNT=$(get_roblox_account)
+
     PREVIOUS_USERNAME=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f1)
     PREVIOUS_USER_ID=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f2)
 
-    echo "Watchdog started (poll ${CHECK_INTERVAL}s, heartbeat ${STATUS_EVERY}s)."
-    echo "CPU in-game threshold: ${CPU_INGAME_THRESHOLD}%"
-    echo "Out-of-game grace: ${OUT_OF_GAME_GRACE}s"
-    echo "Initial instance: $PREVIOUS_INSTANCE_STATUS"
+    echo "Watchdog started."
+    echo "Initial instance status: $PREVIOUS_INSTANCE_STATUS"
 
-    while true; do
-        ITER_START=$(/system/bin/date +%s)
+    if [ "$PREVIOUS_USERNAME" != "N/A" ]; then
+        echo "Initial Roblox account: $PREVIOUS_USERNAME ($PREVIOUS_USER_ID)"
+    else
+        echo "Initial Roblox account: N/A"
+    fi
 
+    while true
+    do
         CURRENT_INSTANCE_STATUS=$(get_instance_status)
 
         if [ "$CURRENT_INSTANCE_STATUS" != "$PREVIOUS_INSTANCE_STATUS" ]; then
+
             if [ "$CURRENT_INSTANCE_STATUS" = "Closed" ]; then
-                echo "Roblox: Running -> Closed"
+
+                echo "Roblox instance changed: Running -> Closed"
+
                 GAME_STATE="NOT_IN_GAME"
-                NOT_IN_GAME_STREAK=0
-                reset_cpu_sampling
+
                 if [ "$RECOVERY_RUNNING" -eq 0 ]; then
+                    echo "Launching Roblox instance..."
+
                     launch_instance
+
                     if [ $? -eq 0 ]; then
                         wait_for_account
                         join_game
                         wait_for_game_start
                     fi
                 fi
+
             else
-                echo "Roblox: Closed -> Running"
+
+                echo "Roblox instance changed: Closed -> Running"
+
                 GAME_STATE="UNKNOWN"
-                NOT_IN_GAME_STREAK=0
-                reset_cpu_sampling
+
             fi
+
             PREVIOUS_INSTANCE_STATUS="$CURRENT_INSTANCE_STATUS"
         fi
 
         ACCOUNT_DATA=$(get_roblox_account)
+
         CURRENT_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
         CURRENT_USER_ID=$(echo "$ACCOUNT_DATA" | cut -d'|' -f2)
+
         CURRENT_ACCOUNT="${CURRENT_USERNAME}|${CURRENT_USER_ID}"
 
         if [ "$CURRENT_ACCOUNT" != "$PREVIOUS_ACCOUNT" ]; then
+
             if [ "$CURRENT_USERNAME" = "N/A" ]; then
-                echo "Roblox account unavailable."
+
+                echo "Roblox account data became unavailable."
+
             elif [ "$PREVIOUS_USERNAME" = "N/A" ]; then
-                echo "Roblox account detected: $CURRENT_USERNAME"
-                ACCOUNT_SEEN_THIS_SESSION=1
+
+                echo "Roblox account detected: $CURRENT_USERNAME ($CURRENT_USER_ID)"
+
             else
-                echo "Roblox account changed: $PREVIOUS_USERNAME -> $CURRENT_USERNAME"
-                ACCOUNT_SEEN_THIS_SESSION=1
+
+                echo "Roblox account changed:"
+                echo "Previous: $PREVIOUS_USERNAME ($PREVIOUS_USER_ID)"
+                echo "Current:  $CURRENT_USERNAME ($CURRENT_USER_ID)"
+
             fi
+
             PREVIOUS_ACCOUNT="$CURRENT_ACCOUNT"
             PREVIOUS_USERNAME="$CURRENT_USERNAME"
             PREVIOUS_USER_ID="$CURRENT_USER_ID"
         fi
 
-        # ---- in-game detection ----
-        CPU_NOW=0
-        UDP_NOW=0
-        if is_process_alive; then
-            update_roblox_cpu_pct
-            CPU_NOW="$ROBLOX_CPU_PCT"
-            is_in_game_network && UDP_NOW=1
-            LAST_UDP="$UDP_NOW"
+        if is_instance_running; then
 
-            if is_in_game "$CPU_NOW" "$UDP_NOW"; then
-                if [ "$GAME_STATE" != "IN_GAME" ]; then
-                    echo "State -> IN_GAME (foreground=${LAST_FOREGROUND_ACTIVITY} cpu=${CPU_NOW}% udp=${UDP_NOW}) reason=${LAST_DETECTION_REASON}"
-                fi
-                GAME_STATE="IN_GAME"
-                NOT_IN_GAME_STREAK=0
-            else
-                NOT_IN_GAME_STREAK=$((NOT_IN_GAME_STREAK + 1))
+            CURRENT_TIME=$(/system/bin/date +%s)
 
-                if [ "$GAME_STATE" != "NOT_IN_GAME" ]; then
-                    echo "State -> NOT_IN_GAME (foreground=${LAST_FOREGROUND_ACTIVITY} cpu=${CPU_NOW}% udp=${UDP_NOW}) reason=${LAST_DETECTION_REASON}"
-                    GAME_STATE="NOT_IN_GAME"
+            if [ "$GAME_STATE" = "IN_GAME" ]; then
+
+                ELAPSED=$((CURRENT_TIME - LAST_JOIN_TIME))
+
+                if [ "$ELAPSED" -ge "$GAME_RECHECK_INTERVAL" ]; then
+
+                    echo "Game state recheck."
+
+                    /system/bin/am start \
+                        -a android.intent.action.VIEW \
+                        -d "roblox://placeId=$ROBLOX_GAME_ID" \
+                        >/dev/null 2>&1
+
+                    LAST_JOIN_TIME=$CURRENT_TIME
+
+                    echo "Game join verification command sent."
+
                 fi
+
+            elif [ "$GAME_STATE" = "UNKNOWN" ]; then
+
+                echo "Game state unknown."
+                echo "Sending initial game join..."
+
+                join_game
+
+            elif [ "$GAME_STATE" = "NOT_IN_GAME" ]; then
+
+                if [ "$RECOVERY_RUNNING" -eq 0 ]; then
+                    echo "Roblox is running but game state is not active."
+                    force_rejoin
+                fi
+
             fi
+
         else
+
             GAME_STATE="NOT_IN_GAME"
-            NOT_IN_GAME_STREAK=0
-            reset_cpu_sampling
-        fi
 
-        if [ "$DETECTION_DEBUG" -eq 1 ]; then
-            print_detection_debug
-        fi
-
-        # ---- rejoin decision (fresh time) ----
-        NOW=$(/system/bin/date +%s)
-        if [ "$NOT_IN_GAME_STREAK" -ge "$OUT_OF_GAME_GRACE" ]; then
-            SINCE_JOIN=$((NOW - LAST_JOIN_TIME))
-            if [ "$RECOVERY_RUNNING" -ne 0 ]; then
-                echo "[block] recovery running."
-            elif [ "$SINCE_JOIN" -lt "$REJOIN_COOLDOWN" ]; then
-                echo "[block] cooldown: ${SINCE_JOIN}s / ${REJOIN_COOLDOWN}s since last join."
-            else
-                echo "Out of game for ${NOT_IN_GAME_STREAK}s — rejoining."
-                send_join_intent
-                GAME_STATE="JOINING"
-                NOT_IN_GAME_STREAK=0
-            fi
-        fi
-
-        # ---- heartbeat ----
-        NOW=$(/system/bin/date +%s)
-        if [ $((NOW - LAST_STATUS_TS)) -ge "$STATUS_EVERY" ]; then
-            ITER_MS=$((NOW - ITER_START))
-            echo "[status] state=${GAME_STATE} foreground=${LAST_FOREGROUND_ACTIVITY} roblox_foreground=${LAST_FOREGROUND_IS_ROBLOX} cpu=${CPU_NOW}% udp=${UDP_NOW} streak=${NOT_IN_GAME_STREAK}/${OUT_OF_GAME_GRACE} since_join=$((NOW - LAST_JOIN_TIME))s reason=${LAST_DETECTION_REASON} iter=${ITER_MS}s"
-            LAST_STATUS_TS=$NOW
         fi
 
         sleep "$CHECK_INTERVAL"
     done
 }
 
-# ============================================================
-#  Main
-# ============================================================
 echo "=============================="
-echo "Cloudphone Monitor v2"
+echo "Cloudphone Monitor"
 echo "=============================="
 echo "Watchdog interval: ${CHECK_INTERVAL}s"
 echo "Discord report interval: ${REPORT_INTERVAL}s"
-echo "CPU in-game threshold: ${CPU_INGAME_THRESHOLD}%"
-echo "Out-of-game grace: ${OUT_OF_GAME_GRACE}s"
-echo "Foreground detection: $([ "$FOREGROUND_CHECK_ENABLED" -eq 1 ] && echo Enabled || echo Disabled)"
-echo "UDP detection: $([ "$UDP_CHECK_ENABLED" -eq 1 ] && echo Enabled || echo Disabled)"
-echo "Detection debug: $([ "$DETECTION_DEBUG" -eq 1 ] && echo Enabled || echo Disabled)"
-echo "Auto game joining: Enabled"
-echo "Auto recovery: Enabled"
-echo "Auto login: $([ -f "$ACCOUNTS_FILE" ] && echo Enabled || echo Disabled)"
+echo "Automatic game joining: Enabled"
+echo "Automatic recovery: Enabled"
+echo "OCR: Disabled"
+echo "Display resizing: Disabled"
 echo "=============================="
 
-echo "[startup] Checking Roblox instance..."
-
-if is_process_alive; then
-    echo "[startup] Roblox is already running."
-    echo "[startup] PID: $(get_roblox_pid)"
-
-    ACCOUNT_SEEN_THIS_SESSION=1
-    CACHED_ACCOUNT_TS=0
-    ACCOUNT_DATA=$(get_roblox_account)
-    U=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
-    [ "$U" != "N/A" ] && echo "Existing account: $U"
-
-    update_roblox_cpu_pct
-    sleep 1
-    update_roblox_cpu_pct
-    CPU_NOW="$ROBLOX_CPU_PCT"
-    UDP_NOW=0
-    is_in_game_network && UDP_NOW=1
-    LAST_UDP="$UDP_NOW"
-
-    if is_in_game "$CPU_NOW" "$UDP_NOW"; then
-        echo "Already in game."
-        echo "  Foreground: ${LAST_FOREGROUND_ACTIVITY}"
-        echo "  CPU: ${CPU_NOW}%"
-        echo "  UDP: ${UDP_NOW}"
-        echo "  Reason: ${LAST_DETECTION_REASON}"
-        GAME_STATE="IN_GAME"
-    else
-        echo "Roblox running but not in-game — joining."
-        echo "  Foreground: ${LAST_FOREGROUND_ACTIVITY}"
-        echo "  CPU: ${CPU_NOW}%"
-        echo "  UDP: ${UDP_NOW}"
-        echo "  Reason: ${LAST_DETECTION_REASON}"
-        join_game
-        wait_for_game_start
-    fi
+if ! is_instance_running; then
+    start_and_join
 else
-    echo "[startup] Roblox instance is NOT running."
-    echo "[startup] Starting Roblox..."
+    ACCOUNT_DATA=$(get_roblox_account)
 
-    launch_instance
+    if [ -n "$ACCOUNT_DATA" ]; then
+        ROBLOX_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
 
-    if [ $? -eq 0 ]; then
-        echo "[startup] Roblox successfully launched."
-        wait_for_account
-        if [ $? -eq 0 ]; then
-            join_game
-            wait_for_game_start
-        else
-            echo "[startup] Could not detect Roblox account."
+        if [ "$ROBLOX_USERNAME" != "N/A" ]; then
+            echo "Existing Roblox account detected: $ROBLOX_USERNAME"
         fi
-    else
-        echo "[startup] ERROR: Roblox could not be launched."
     fi
+
+    echo "Roblox instance already running."
+    echo "Sending game join command..."
+
+    join_game
+    wait_for_game_start
 fi
 
 watchdog &
 WATCHDOG_PID=$!
 
-while true; do
+while true
+do
     send_report
-    echo "Next report in ${REPORT_INTERVAL}s."
+
+    echo "Next Discord report in ${REPORT_INTERVAL} seconds."
+
     sleep "$REPORT_INTERVAL"
 done
