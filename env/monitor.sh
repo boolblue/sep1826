@@ -446,6 +446,9 @@ auto_login() {
 #  Launch / join
 # ============================================================
 launch_instance() {
+    ACCOUNT_SEEN_THIS_SESSION=0
+    LOGIN_ATTEMPTED=0
+    UI_DUMP_TS=0
     echo "Launching $TARGET_PACKAGE..."
     /system/bin/am start -n "$TARGET_PACKAGE/$TARGET_ACTIVITY" >/dev/null 2>&1
 
@@ -495,6 +498,7 @@ send_join_intent() {
         -d "roblox://placeId=$ROBLOX_GAME_ID" \
         >/dev/null 2>&1
     LAST_JOIN_TIME=$(/system/bin/date +%s)
+    UI_DUMP_TS=0
 }
 
 join_game() {
@@ -673,6 +677,70 @@ EOF
 }
 
 # ============================================================
+#  Screen classification  (UI dump based)
+# ============================================================
+UI_DUMP_TS=0
+
+get_ui_dump() {
+    NOW=$(/system/bin/date +%s)
+    if [ $((NOW - UI_DUMP_TS)) -lt "$UI_CHECK_INTERVAL" ] && [ -f "$UI_DUMP_PATH" ]; then
+        return 0
+    fi
+    /system/bin/uiautomator dump "$UI_DUMP_PATH" >/dev/null 2>&1
+    UI_DUMP_TS=$NOW
+    [ -f "$UI_DUMP_PATH" ]
+}
+
+# Prints one of: IN_GAME | HOME | LOADING | DISCONNECTED | LOGIN | UNKNOWN
+detect_roblox_screen() {
+    get_ui_dump || { echo "UNKNOWN"; return; }
+    [ ! -f "$UI_DUMP_PATH" ] && { echo "UNKNOWN"; return; }
+
+    # --- 1. Disconnect / kick / lost connection dialogs -------------
+    # These strings cover the common Roblox error UIs, including the
+    # "only a Leave button" case you mentioned.
+    if grep -qE 'text="[^"]*(Disconnected|Lost connection|Connection lost|You have been kicked|Kicked from|Failed to connect|Error Code|Reconnect|Please rejoin|Lost Connection)[^"]*"' "$UI_DUMP_PATH"; then
+        echo "DISCONNECTED"; return
+    fi
+
+    # --- 2. Loading / joining server -------------------------------
+    if grep -qE 'text="[^"]*(Joining server|Loading|Connecting to|Please wait)[^"]*"' "$UI_DUMP_PATH"; then
+        echo "LOADING"; return
+    fi
+
+    # --- 3. Login screen -------------------------------------------
+    HAS_PW=0
+    grep -qE 'text="Password"' "$UI_DUMP_PATH" && HAS_PW=1
+    grep -qE 'resource-id="[^"]*edit_password' "$UI_DUMP_PATH" && HAS_PW=1
+    HAS_BTN=0
+    grep -qE 'text="(Log ?In|Login|Sign ?In)"' "$UI_DUMP_PATH" && HAS_BTN=1
+    grep -qE 'resource-id="[^"]*(btn_login|button_login)' "$UI_DUMP_PATH" && HAS_BTN=1
+    if [ "$HAS_PW" -eq 1 ] && [ "$HAS_BTN" -eq 1 ]; then
+        echo "LOGIN"; return
+    fi
+
+    # --- 4. Roblox home screen (bottom navigation tabs) ------------
+    HOME_HITS=0
+    grep -qE 'text="Home"'                             "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
+    grep -qE 'text="(Avatar|Marketplace|Charts|Create|Robux|More)"' "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
+    grep -qE 'content-desc="[^"]*(Home|Avatar|Marketplace|More)[^"]*"' "$UI_DUMP_PATH" && HOME_HITS=$((HOME_HITS + 1))
+
+    if [ "$HOME_HITS" -ge 2 ]; then
+        echo "HOME"; return
+    fi
+
+    # --- 5. In-game (leave menu present in HUD, or jump / menu) ----
+    if grep -qE 'text="Leave"'                            "$UI_DUMP_PATH" \
+       || grep -qE 'content-desc="[^"]*[Ll]eave[^"]*"'   "$UI_DUMP_PATH" \
+       || grep -qE 'content-desc="[^"]*[Jj]ump[^"]*"'    "$UI_DUMP_PATH" \
+       || grep -qE 'resource-id="[^"]*game_menu'         "$UI_DUMP_PATH"; then
+        echo "IN_GAME"; return
+    fi
+
+    echo "UNKNOWN"
+}
+
+# ============================================================
 #  Watchdog — real-time, and does NOT re-join while in-game
 # ============================================================
 watchdog() {
@@ -681,21 +749,23 @@ watchdog() {
     PREVIOUS_USERNAME=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f1)
     PREVIOUS_USER_ID=$(echo "$PREVIOUS_ACCOUNT" | cut -d'|' -f2)
 
-    echo "Watchdog started (interval ${CHECK_INTERVAL}s)."
+    echo "Watchdog started (poll ${CHECK_INTERVAL}s, screen-check ${UI_CHECK_INTERVAL}s)."
     echo "Initial instance: $PREVIOUS_INSTANCE_STATUS"
-    [ "$PREVIOUS_USERNAME" != "N/A" ] && \
-        echo "Initial account: $PREVIOUS_USERNAME ($PREVIOUS_USER_ID)"
+
+    SCREEN_STATE="UNKNOWN"
 
     while true; do
+        NOW=$(/system/bin/date +%s)
         CURRENT_INSTANCE_STATUS=$(get_instance_status)
 
-        # ---------- process state transition ----------
+        # ---- process up/down transitions ----
         if [ "$CURRENT_INSTANCE_STATUS" != "$PREVIOUS_INSTANCE_STATUS" ]; then
             if [ "$CURRENT_INSTANCE_STATUS" = "Closed" ]; then
                 echo "Roblox: Running -> Closed"
                 GAME_STATE="NOT_IN_GAME"
+                SCREEN_STATE="UNKNOWN"
+                UI_DUMP_TS=0     # force fresh dump next time
                 if [ "$RECOVERY_RUNNING" -eq 0 ]; then
-                    echo "Re-launching Roblox..."
                     launch_instance
                     if [ $? -eq 0 ]; then
                         LOGIN_ATTEMPTED=0
@@ -707,11 +777,13 @@ watchdog() {
             else
                 echo "Roblox: Closed -> Running"
                 GAME_STATE="UNKNOWN"
+                SCREEN_STATE="UNKNOWN"
+                UI_DUMP_TS=0
             fi
             PREVIOUS_INSTANCE_STATUS="$CURRENT_INSTANCE_STATUS"
         fi
 
-        # ---------- account change ----------
+        # ---- account change detection (unchanged) ----
         ACCOUNT_DATA=$(get_roblox_account)
         CURRENT_USERNAME=$(echo "$ACCOUNT_DATA" | cut -d'|' -f1)
         CURRENT_USER_ID=$(echo "$ACCOUNT_DATA" | cut -d'|' -f2)
@@ -719,50 +791,91 @@ watchdog() {
 
         if [ "$CURRENT_ACCOUNT" != "$PREVIOUS_ACCOUNT" ]; then
             if [ "$CURRENT_USERNAME" = "N/A" ]; then
-                echo "Roblox account data unavailable."
+                echo "Roblox account unavailable."
             elif [ "$PREVIOUS_USERNAME" = "N/A" ]; then
-                echo "Roblox account detected: $CURRENT_USERNAME ($CURRENT_USER_ID)"
+                echo "Roblox account detected: $CURRENT_USERNAME"
+                ACCOUNT_SEEN_THIS_SESSION=1
             else
                 echo "Roblox account changed: $PREVIOUS_USERNAME -> $CURRENT_USERNAME"
+                ACCOUNT_SEEN_THIS_SESSION=1
             fi
             PREVIOUS_ACCOUNT="$CURRENT_ACCOUNT"
             PREVIOUS_USERNAME="$CURRENT_USERNAME"
             PREVIOUS_USER_ID="$CURRENT_USER_ID"
         fi
 
-        # ---------- game-state reconciliation ----------
+        # ---- screen-state reconciliation ----
         if is_process_alive; then
-            # If we're focused on the game activity, we are in-game — do nothing.
-            if is_in_game_activity; then
-                GAME_STATE="IN_GAME"
 
-            # Roblox is alive but we're NOT on the game activity.
-            elif is_roblox_focused; then
-                # Roblox home / launcher screen — safe to (re)join.
-                NOW=$(/system/bin/date +%s)
-                ELAPSED=$((NOW - LAST_JOIN_TIME))
-                if [ "$GAME_STATE" = "JOINING" ] && [ "$ELAPSED" -lt "$JOIN_TIMEOUT" ]; then
-                    : # still inside the join window, don't spam
-                elif [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                    echo "Roblox on home screen — joining game."
-                    join_game
-                    wait_for_game_start
-                fi
+            if ! is_roblox_focused; then
+                # Roblox backgrounded by the user — don't touch it.
+                SCREEN_STATE="BACKGROUND"
 
             else
-                # Roblox is running in the background (e.g. user opened something else).
-                # Only nudge it back if we consider ourselves not-in-game.
-                if [ "$GAME_STATE" != "IN_GAME" ]; then
-                    NOW=$(/system/bin/date +%s)
-                    ELAPSED=$((NOW - LAST_JOIN_TIME))
-                    if [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
-                        echo "Roblox not focused — sending join intent."
-                        send_join_intent
-                    fi
+                # Classify what's actually on screen (throttled inside).
+                NEW_SCREEN=$(detect_roblox_screen)
+
+                if [ "$NEW_SCREEN" != "$SCREEN_STATE" ]; then
+                    echo "Screen state: $SCREEN_STATE -> $NEW_SCREEN"
+                    SCREEN_STATE="$NEW_SCREEN"
                 fi
+
+                case "$SCREEN_STATE" in
+                    IN_GAME)
+                        GAME_STATE="IN_GAME"
+                        ;;
+
+                    LOADING)
+                        # Roblox is doing something — leave it alone.
+                        GAME_STATE="JOINING"
+                        ;;
+
+                    DISCONNECTED)
+                        ELAPSED=$((NOW - LAST_JOIN_TIME))
+                        if [ "$RECOVERY_RUNNING" -eq 0 ] && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
+                            echo "Disconnect detected — rejoining."
+                            # Tap 'Leave'/'OK' first if present, then re-issue join.
+                            leave_btn=$(grep -oE 'text="(Leave|OK|Okay|Reconnect)"[^>]*bounds="\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]"' "$UI_DUMP_PATH" | head -1)
+                            if [ -n "$leave_btn" ]; then
+                                B=$(echo "$leave_btn" | grep -oE '\[[0-9]+,[0-9]+\]\[[0-9]+,[0-9]+\]')
+                                X1=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\1/')
+                                Y1=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\2/')
+                                X2=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\3/')
+                                Y2=$(echo "$B" | sed -E 's/\[([0-9]+),([0-9]+)\]\[([0-9]+),([0-9]+)\]/\4/')
+                                X=$(( (X1 + X2) / 2 ))
+                                Y=$(( (Y1 + Y2) / 2 ))
+                                /system/bin/input tap "$X" "$Y"
+                                sleep 2
+                            fi
+                            force_rejoin
+                        fi
+                        ;;
+
+                    HOME)
+                        GAME_STATE="NOT_IN_GAME"
+                        ELAPSED=$((NOW - LAST_JOIN_TIME))
+                        if [ "$RECOVERY_RUNNING" -eq 0 ] && [ "$ELAPSED" -ge "$REJOIN_COOLDOWN" ]; then
+                            echo "On Roblox home — rejoining game."
+                            join_game
+                            wait_for_game_start
+                            UI_DUMP_TS=0
+                        fi
+                        ;;
+
+                    LOGIN)
+                        GAME_STATE="NOT_IN_GAME"
+                        # wait_for_account handles auto-login guardrails.
+                        ;;
+
+                    UNKNOWN|BACKGROUND)
+                        # Not enough signal — do nothing.
+                        ;;
+                esac
             fi
+
         else
             GAME_STATE="NOT_IN_GAME"
+            SCREEN_STATE="UNKNOWN"
         fi
 
         sleep "$CHECK_INTERVAL"
